@@ -390,16 +390,17 @@ def _reason(o, cand, dem) -> str:
         parts.append("No model has been trained yet, so there is no prediction. "
                      "What follows is only what was scraped.")
 
-    # 1. the promoted card
+    # 1. the featured card, which is Play saying it already knows the answer
     if (f.get("featured_relevance") or 0) >= RELEVANT:
         parts.append(
-            f"Play runs a promoted card above the results and it is a direct rival, "
-            f"so the most visible slot on the page is already taken and organic "
-            f"rank 1 is worth much less than it looks.")
+            "Play answers this phrase with a featured card above the results, and "
+            "it is a direct rival. That is Play saying it is confident which app "
+            "people mean, so the most visible slot is spoken for and organic rank "
+            "1 is worth much less than it looks.")
     elif f.get("has_featured"):
         parts.append(
-            f"Play runs a promoted card above the organic results, which takes a "
-            f"share of the taps before anyone scrolls.")
+            "Play shows a featured card above the organic results, which takes a "
+            "share of the taps before anyone scrolls.")
 
     # 2. intent, defined ONE way: the group of apps answering the same question.
     # Lexical relevance said "5 of 10 are about this" while the clustering said
