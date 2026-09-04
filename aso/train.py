@@ -7,6 +7,7 @@ and a model that agrees with whoever used the CLI most.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -16,7 +17,12 @@ import torch.nn.functional as F
 from . import dataset, db, features, memory, metrics
 from .model import Ensemble, n_params
 
-MODELS = Path(__file__).resolve().parent.parent / "data" / "models"
+# Where trained checkpoints live. Overridable because in a container the repo
+# directory is part of the image: writing there means every rebuild silently
+# discards every model ever trained, and leaves the registry pointing at paths
+# that no longer exist. Point this at a volume.
+MODELS = Path(os.environ.get(
+    "ASO_MODELS", Path(__file__).resolve().parent.parent / "data" / "models"))
 
 # The checkpoint that ships with the repo. Versioned models live under data/
 # (gitignored working history); this one is committed so a fresh clone can
@@ -223,6 +229,10 @@ def bootstrap(con, k=7, hidden=24):
     path = MODELS / "v0.pt"
     model.save(path, ident, identf, meta)
     with con.transaction():
+        # Clear the flag first. Without this the bootstrap adds a second active
+        # row beside a real trained one, and "the active model" becomes whichever
+        # the query happens to return.
+        con.execute("UPDATE registry SET active=0")
         con.execute("INSERT INTO registry (version, path, created_at, "
                     "n_rows, golden_auc, golden_ece, active) VALUES (%s,%s,%s,0,0.5,0.5,1) "
                     "ON CONFLICT (version) DO UPDATE SET path=excluded.path, "
@@ -251,7 +261,10 @@ def load_active(con, create=True):
     repo, then random weights. The middle step is what lets someone clone and
     predict without scraping anything first.
     """
-    row = con.execute("SELECT version, path FROM registry WHERE active=1").fetchone()
+    # Newest first: a stray second active row is a bug, but it should not make
+    # the served model depend on row order while it is being fixed.
+    row = con.execute("SELECT version, path FROM registry WHERE active=1 "
+                      "ORDER BY created_at DESC LIMIT 1").fetchone()
     if row:
         got = _usable(row["path"])
         if got:
