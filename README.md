@@ -125,7 +125,7 @@ measurements.
 | Line | Means |
 |---|---|
 | `rank` | where a well-built new app would land, from the network |
-| `downloads` | what apps in that position actually get. Range is the ensemble's disagreement |
+| `downloads` | an order of magnitude, not a number — see below. Range is the ensemble's disagreement |
 | `competition` | the score needed to hold the last qualifying slot |
 | `same question` | how many ranked apps share your **meaning**, not just your words |
 | `intent split` | when Play is answering several different questions on one page |
@@ -133,6 +133,29 @@ measurements.
 
 **`chance of top 10` is the model's odds of ranking. Whether that is worth
 building is decided by your thresholds, not by the model.**
+
+### How much to trust the downloads figure
+
+Measured on 170 held-out new apps, on keywords the model never trained on:
+
+```
+  median predicted / actual :  0.91x     <- no systematic bias
+  median error              :  4.7x off
+  within 10x of actual      :  70%
+```
+
+**Read it as an order of magnitude and lean on the printed range.** Two reasons
+it cannot be much better, both structural:
+
+- **Demand splits across ranks invisibly.** We observe position and installs,
+  never impressions or taps. Rank #3 on a keyword nobody searches and rank #3 on
+  a busy one look identical in the data.
+- **The label is bucketed.** Play reports `100+`, `500+`, `1,000+`. For exactly
+  the small apps you compete against, the ground truth is a range, so a 4.7x
+  error against a label that is itself ±5x is near the measurement floor.
+
+The **rank** prediction does not have this problem, because ordering needs only
+relative comparisons and those are directly observed.
 
 ## Your thresholds
 
@@ -235,6 +258,67 @@ Ingests are **resumable** — a keyword scraped within `fresh_days` is skipped, 
 stop and restart freely. Play's developer page caps at 100 apps, so a larger
 catalogue needs a Play Console export.
 
+## Caching
+
+Autocomplete is cached for **a day**, because it moves slowly and refetching on
+every analyze spent a round trip to learn nothing.
+
+```bash
+aso suggest "warranty tracker"              # cached
+aso suggest "warranty tracker" --no-cache   # refetch AND update the cache
+aso config suggest_ttl_hours 6              # tighten it
+```
+
+`--no-cache` skips the read but still performs the write, so the next caller
+serves the refreshed list rather than paying for the same fetch again.
+
+If a refetch fails the stale list is returned rather than nothing — a day-old
+ordering beats no ordering, and the next call retries. `--games` bypasses the
+cache entirely, since it uses a different Play filter and would poison the
+app-filtered rows.
+
+## Reading the Play Store directly
+
+Everything the underlying Play reader can do, wrapped so you can look at the raw
+page without going through the model. Useful for checking what the analyser was
+actually looking at when a result seems wrong.
+
+```bash
+aso suggest "warranty"                    # autocomplete, in Play's own order
+aso suggest "puzzle" --games
+aso search "spider tracker"               # top results with correct organic ranks
+aso search "spider tracker" --details --limit 10
+aso details com.duolingo                  # package name or full Play Store URL
+aso publisher "Some Developer Name"       # caps near 50; see fetch_publisher.py
+```
+
+Two things these add over calling the library yourself.
+
+**Organic ranks are right.** Play prepends a promoted hero card that is not part
+of the ranked list, so numbering straight off the array records a paid placement
+as #1 and shifts every real position by one:
+
+```
+  3 organic results for 'spider tracker', plus a promoted card
+
+  ad   Spider Tracker                            10K+
+    1  Tracker Network Stats               5,000,000+
+    2  Strava: Run, Bike, Walk           100,000,000+
+```
+
+The card comes back as `position: null, featured: true` rather than being
+silently numbered.
+
+**`details` shows both shapes**, so you can see how a string was read:
+
+```
+  installs   500,000,000+   read as 963,136,826
+  released   May 29, 2013   read as 2013-05-29
+```
+
+That is the same normalisation the model consumes, so a feature that looks wrong
+can be traced here.
+
 ## Watching change over time
 
 ```bash
@@ -258,26 +342,126 @@ Roughly 16 seconds of every CLI invocation is import and warm-up, 13.7s of it
 the sentence encoder. A resident process pays that once.
 
 ```bash
-aso serve                     # 127.0.0.1:8765
+aso serve                                     # 127.0.0.1:8765
+aso serve --max-concurrent 8 --timeout 300
 ```
 
 The CLI uses it automatically when it is up (`--no-server` to force in-process).
 Same query: **~4s via the server, ~58s without.**
 
+### Ports
+
+**`--port` is strict.** Naming a port means you want that port, so it is used or
+the start fails. Omitting it means you do not care, so the default moves up if
+busy.
+
+```bash
+aso serve                      # 8765, or the next free port if taken
+aso serve --port 9000          # 9000 or fail
+aso serve --port 9000 --auto-port   # 9000, but move up rather than fail
+```
+
+```
+$ aso serve                    # 8765 busy
+  port 8765 is held by another aso server (model v65), using 8766 instead
+  listening on http://127.0.0.1:8766
+
+$ aso serve --port 9200        # 9200 busy
+  port 9200 is held by another aso server.
+    You asked for this port specifically, so it was not moved.
+    aso serve --port 9200 --auto-port   move up if busy
+    aso serve                            use the default, 8765
+```
+
+The failure names *what* holds the port — another aso server or an unrelated
+process — because those want different responses from you. It also binds before
+loading the model, so a busy port fails in milliseconds rather than after the
+16s warm-up.
+
+**Clients find it on their own.** A running server records itself in
+`data/server.json`, and the CLI resolves in order: `ASO_SERVER` → that runfile →
+the default port. The recorded PID is checked before the file is trusted, so a
+crashed server does not send requests into a void.
+
+```bash
+aso serve --port 9000         # in one terminal
+aso analyze "habit tracker"   # in another - finds 9000 without being told
+```
+
+### Concurrency
+
+Default is **4 requests at once**, deliberately low: a cold keyword holds its
+slot for ~40s of scraping, and unbounded threads means concurrent scrapes that
+Play rate-limits. Over the limit you get `503` with `retry_after_seconds`, not a
+queue that silently grows.
+
+It can be retuned **while the server is running** - no restart, so you never pay
+the 16s warm-up to change a number:
+
+```bash
+curl -s localhost:8765/config -d '{"server_max_concurrent":12,"server_timeout":300}'
+curl -s localhost:8765/config -d '{"server_max_concurrent":12,"persist":true}'   # and save it
+aso config server_max_concurrent 6            # the server notices on its own
+```
+
+Lowering the limit lets in-flight work finish and admits fewer afterwards;
+nothing is cancelled. A value passed to `aso serve` is **pinned** and will not be
+overridden by a later config edit — `/health` reports which mode you are in.
+
 ## API
 
 ```
-GET  /health     {"ok":true,"model":"v59","uptime_seconds":33,"warm_seconds":16.4}
+GET  /health     model, uptime, in_flight, max_concurrent, timeout, and counters
+                 for rejected_busy / timed_out / client_disconnects
 GET  /status     row counts and the active model
-GET  /config     current thresholds
+GET  /config     thresholds and the live server limits
 
 POST /analyze    {"keyword":"...", "pkg":"...", "country":"us", "learn":false,
+                  "timeout":60,
                   "min_downloads":100, "min_downloads_unit":"day",
                   "max_rank":5, "min_build_score":0, "min_model_confidence":0}
 POST /why        {"keyword":"...", "pkg":"..."}
 POST /correct    {"keyword":"...", "pkg":"...", "rank":4, "reviewer":"agent"}
 POST /train      {"epochs":400}
+POST /config     {"server_max_concurrent":12, "server_timeout":300, "persist":false}
 ```
+
+Raw Play passthroughs — no model, no database, no scraping into the DB:
+
+```
+POST /suggest    {"keyword":"warranty", "games":false, "no_cache":false}
+POST /search     {"keyword":"...", "details":false, "limit":10}
+POST /details    {"pkg":"com.foo"}                  # package name or URL
+POST /publisher  {"developer":"..."}
+```
+
+`/search` returns `position: null, featured: true` for a promoted card, and
+`/details` returns both `raw` (Play's fields) and `normalised` (what the model
+consumes), so an agent can check how a value was interpreted.
+
+`/suggest` reports its own cache state, so a caller can decide whether to force
+a refresh:
+
+```json
+{"query":"warranty", "suggestions":[...], "count":5,
+ "cached":true, "age_hours":3.2}
+```
+
+### Errors
+
+Every failure is JSON with an `error` and a `detail`, never a stack trace.
+
+| Status | Means |
+|---|---|
+| `400` | bad request — `detail` says what was missing |
+| `404` | no such route |
+| `503` | at the concurrency limit; `retry_after_seconds` included |
+| `504` | over the timeout. **The work continues in the background** — a thread cannot be killed safely and a half-finished scrape would leave a partial row, so the same request is fast once the scrape lands |
+| `500` | anything else, with the exception type in `detail` |
+
+A client that hangs up mid-answer (curl `--max-time`, an abandoned request) is
+routine, not an error: it is counted as `client_disconnects` and logged as one
+line rather than a traceback.
 
 ```bash
 curl -s localhost:8765/analyze -d '{"keyword":"habit tracker"}' | jq .recommendation
@@ -323,7 +507,12 @@ you want the old behaviour.
   **will** collide — use the server.
 - `aso analyze` scrapes on a cache miss: roughly 40s for a new keyword, ~4s for
   one already stored.
-- Package arguments accept a bare package or any Play Store URL.
+- Package arguments accept a bare package or any Play Store URL, everywhere.
+- The Play passthroughs (`/search`, `/details`, `/publisher`) do not write to the
+  database, so they are safe to call freely and never affect what the model later
+  trains on. `/suggest` is the exception: it maintains its own day-long cache.
+- A busy port is not an error. The server moves to the next free one and records
+  where it landed, so scripts do not need to coordinate.
 
 ---
 
@@ -368,6 +557,15 @@ what keeps the counterfactual in `aso why` meaningful.
   its input and forecast zero for anything unlaunched.
 - **Nothing promotes that regresses the holdout**, once there are enough keywords
   for that score to mean anything.
+- **The downloads label comes only from apps under 18 months old.** The same
+  arithmetic on an eight-year-old app gives a lifetime average earned over years
+  of already ranking — median 262,952/yr against 4,947/yr for a newcomer. Training
+  on both had it forecasting 57,000 downloads a day for an unlaunched app.
+- **No connection is held across network I/O.** Scrape rows are buffered and
+  written in one short transaction; the schema is created only when missing,
+  because DDL opens a write transaction that pins the lock for the life of the
+  connection. That single line was what made every concurrent command fail with
+  `database is locked`.
 
 ## Data
 

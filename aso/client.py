@@ -11,13 +11,34 @@ import os
 import urllib.error
 import urllib.request
 
+from . import env as _env
 from .server import HOST, PORT
 
-BASE = os.environ.get("ASO_SERVER", f"http://{HOST}:{PORT}")
+_env.load()
+
+def base() -> str:
+    """Where the server is.
+
+    ASO_SERVER wins. Otherwise the default port, and failing that whatever a
+    running server recorded in its runfile - so `aso serve --port 9000` is found
+    without every command needing to be told.
+    """
+    if os.environ.get("ASO_SERVER"):
+        return os.environ["ASO_SERVER"]
+    from .server import read_runfile
+    got = read_runfile()
+    if got:
+        return f"http://{got['host']}:{got['port']}"
+    return f"http://{HOST}:{PORT}"
+
+
+BASE = base()
 
 
 def up(timeout: float = 0.4) -> dict | None:
     """Is a server listening? Short timeout: this runs before every command."""
+    global BASE
+    BASE = base()
     try:
         with urllib.request.urlopen(f"{BASE}/health", timeout=timeout) as r:
             return json.loads(r.read())
@@ -27,9 +48,12 @@ def up(timeout: float = 0.4) -> dict | None:
 
 def call(route: str, payload: dict | None = None, timeout: float = 900) -> dict:
     data = json.dumps(payload or {}).encode() if payload is not None else None
+    headers = {"Content-Type": "application/json"}
+    token = os.environ.get("ASO_API_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(
-        f"{BASE}{route}", data=data,
-        headers={"Content-Type": "application/json"},
+        f"{base()}{route}", data=data, headers=headers,
         method="POST" if data is not None else "GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -38,4 +62,4 @@ def call(route: str, payload: dict | None = None, timeout: float = 900) -> dict:
         body = json.loads(e.read() or b"{}")
         raise SystemExit(body.get("error", f"server returned {e.code}"))
     except urllib.error.URLError as e:
-        raise SystemExit(f"no server at {BASE} ({e.reason}). Start one: aso serve")
+        raise SystemExit(f"no server at {base()} ({e.reason}). Start one: aso serve")

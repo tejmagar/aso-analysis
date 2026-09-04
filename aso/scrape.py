@@ -190,6 +190,11 @@ def scrape_keyword(con, keyword: str, country="us", lang="en",
     observed_at = db.now()
     n = 0
     failed = 0
+    # Buffer the rows and write them in ONE short transaction at the end. Writing
+    # inside the fetch loop held the database open across every network call -
+    # roughly 40 seconds per keyword - and that is what made concurrent commands
+    # fail with "database is locked".
+    pending: list[tuple[dict, int | None, bool]] = []
     task = ui.Task("fetching app details", total=len(ranked), quiet=quiet or not with_details)
     task.__enter__()
     for pos, r in ranked:
@@ -206,14 +211,19 @@ def scrape_keyword(con, keyword: str, country="us", lang="en",
             except Exception:                           # noqa: BLE001 - keep the crawl going
                 failed += 1
             time.sleep(sleep)
-        db.upsert_app(con, to_app_row(payload, country, lang))
-        con.execute(
-            "INSERT OR IGNORE INTO observations "
-            "(keyword, country, pkg, position, source, featured, observed_at) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (keyword, country, pkg, pos, "serp", int(bool(r.get("featured"))), observed_at))
+        pending.append((to_app_row(payload, country, lang), pos,
+                        bool(r.get("featured"))))
         n += pos is not None
-    con.commit()
+
+    with con:                                  # one transaction, milliseconds
+        for row, pos, is_featured in pending:
+            db.upsert_app(con, row)
+            con.execute(
+                "INSERT OR IGNORE INTO observations "
+                "(keyword, country, pkg, position, source, featured, observed_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (keyword, country, row["pkg"], pos, "serp", int(is_featured),
+                 observed_at))
 
     # Record the field's shape at this moment. Written HERE, not in analyze(),
     # because every path that scrapes must extend the series: ingest and track

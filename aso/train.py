@@ -110,6 +110,10 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True):
         "features": [f.name for f in features.REGISTRY],
         "n_rows": int(len(y)), "n_keywords": int(len(np.unique(data["groups"]))),
         "golden_auc": g_auc, "golden_ece": g_ece,
+        # The ceiling for the downloads head: the highest first-year rate the
+        # data contains, so predictions cannot be uncapped extrapolation.
+        "velocity_max": float(np.nanmax(data["v"])) if np.isfinite(
+            np.nanmax(data["v"])) else 0.0,
         # reference quantiles: turn a raw logit into a 0-100 fit/crowding score
         "logit_q": np.percentile(logits_all, np.arange(0, 101)).tolist(),
     }

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -12,6 +13,7 @@ DB_PATH = Path(os.environ.get("ASO_DB", ROOT / "data" / "aso.db"))
 SCHEMA = ROOT / "schema.sql"
 
 ABSENT = 251  # checked and not in the top 250
+BUSY_TIMEOUT = 20.0   # seconds a writer waits for the lock before giving up
 
 
 def now() -> str:
@@ -27,11 +29,29 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     forget: any command works against a fresh checkout."""
     path = Path(path or DB_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(path)
+    con = sqlite3.connect(path, timeout=BUSY_TIMEOUT)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA foreign_keys=ON")
-    con.executescript(SCHEMA.read_text())          # every statement is IF NOT EXISTS
+    # Wait for a busy writer instead of failing instantly. Without this a second
+    # command raises "database is locked" the moment two things overlap, which
+    # is constantly: analyze scrapes, train writes, the server serves.
+    con.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT * 1000)}")
+
+    # Create the schema only when it is actually missing.
+    #
+    # Running the script on every connect looked harmless because every
+    # statement is IF NOT EXISTS - but DDL opens a WRITE transaction, and
+    # python's sqlite3 does not commit it until something else does. So every
+    # connection sat holding the write lock for its whole life, and a 40-second
+    # scrape blocked every other command with "database is locked". The
+    # busy_timeout above never helped, because the holder never let go.
+    have = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='observations'"
+    ).fetchone()
+    if not have:
+        con.executescript(SCHEMA.read_text())
+        con.commit()
     return con
 
 
@@ -138,3 +158,19 @@ def ranked_field(con, keyword: str, country="us") -> list[dict]:
         r["slot"] = i
         r["position"] = i          # what every downstream reader uses
     return rows
+
+
+@contextmanager
+def session(path=None):
+    """A connection held for exactly as long as it is used.
+
+    The rule this exists to enforce: never hold a connection across network I/O.
+    Scraping a keyword takes ~40s, and keeping the handle open for all of it made
+    every other command wait or fail on "database is locked". Open late, write,
+    close.
+    """
+    con = connect(path)
+    try:
+        yield con
+    finally:
+        con.close()

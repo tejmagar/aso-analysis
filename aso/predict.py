@@ -204,17 +204,21 @@ def score_entry(con, keyword: str, country="us"):
     n_kw = blob["meta"].get("n_keywords", 0)
     evidence = min(n_kw / 25.0, 1.0)
     conf = agree * evidence
-    # The head predicts log1p(installs/year). Cap before expm1: the largest app
-    # on Play is ~1e10 installs, so anything past log1p of that is the model
-    # having diverged, not a forecast, and expm1 overflows to inf above ~709.
-    LOG_CAP = math.log1p(1e10)
+    # The head predicts log1p(installs/year) for a NEW app. Cap at the largest
+    # first-year figure the training data actually contains: beyond that the
+    # model is extrapolating past anything it has seen, and expm1 overflows to
+    # inf above ~709 regardless.
+    LOG_CAP = blob["meta"].get("velocity_max", math.log1p(5e7))
+    SPREAD_CAP = 2.0        # the ensemble's std, bounded so one wild member
+                            # cannot turn the range into "3.8K to 10 billion"
 
     def undo(x):
         return float(np.expm1(min(max(x, 0.0), LOG_CAP)))
 
+    spread = min(float(v_std), SPREAD_CAP)
     per_year = undo(float(v_mean))
-    lo = undo(float(v_mean) - float(v_std))
-    hi = undo(float(v_mean) + float(v_std))
+    lo = undo(float(v_mean) - spread)
+    hi = undo(float(v_mean) + spread)
     return {
         "entry_rank": 1 + int((field_logits > ghost_logit).sum()),
         "downloads": {

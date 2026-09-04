@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
-from . import db
+from . import db, env
+
+env.load()          # .env first, so ASO_API_TOKEN and friends are visible
 
 W = 22
 
@@ -656,7 +659,9 @@ def cmd_config(a):
               ("wording", ("build_score_strong", "build_score_maybe")),
               ("what counts as ranking", ("top_k", "country")),
               ("collection", ("fresh_days", "track_every_days", "new_app_years",
-                              "scrape_sleep"))]
+                              "scrape_sleep")),
+              ("server", ("server_max_concurrent", "server_timeout",
+                          "suggest_ttl_hours"))]
     for title, keys in groups:
         print(f'  {tui.GRAY}{title}{tui.RESET}')
         for k in keys:
@@ -788,9 +793,145 @@ def cmd_why(a):
     con.close()
 
 
+def cmd_suggest(a):
+    from . import play, tui
+    out = play.suggest(a.query, games=a.games, no_cache=a.no_cache)
+    if a.json:
+        print(json.dumps(out, indent=2))
+        return
+    if not out:
+        print(f'  {tui.AMBER}Play suggests nothing for {a.query!r}{tui.RESET}')
+        return
+    from . import db as _db
+    from . import suggest as _s
+    _c = _db.connect()
+    age = _s.age_hours(_c, a.query)
+    _c.close()
+    when = ("just fetched" if a.no_cache or age is None or age < 0.02
+            else f"cached {age:.0f}h ago" if age >= 1 else "cached moments ago")
+    print(f'\n  {tui.FAINT}{len(out)} suggestions for {a.query!r}, {when}{tui.RESET}\n')
+    q = " ".join(a.query.strip().lower().split())
+    for i, t in enumerate(out, 1):
+        mark = f'{tui.CYAN}▸{tui.RESET}' if t.lower() == q else " "
+        print(f'  {mark} {tui.FAINT}{i}{tui.RESET}  {tui.WHITE}{t}{tui.RESET}')
+    print()
+
+
+def cmd_search(a):
+    from . import play, tui
+    from .analyze import fmt_n
+    out = play.search(a.query, with_details=a.details, limit=a.limit)
+    if a.json:
+        print(json.dumps(out, indent=2))
+        return
+    ranked = sum(1 for r in out if r["position"])
+    print(f'\n  {tui.FAINT}{ranked} organic results for {a.query!r}'
+          f'{", plus a promoted card" if ranked < len(out) else ""}{tui.RESET}\n')
+    for r in out:
+        slot = f'{r["position"]:>3}' if r["position"] else f'{tui.AMBER}ad{tui.RESET} '
+        inst = r.get("installs_real") or r.get("installs") or ""
+        print(f'  {slot}  {tui.WHITE}{(r.get("title") or "")[:34]:<34}{tui.RESET}'
+              f'{tui.GRAY}{str(inst)[:12]:>12}{tui.RESET}  '
+              f'{tui.FAINT}{r.get("package", "")[:30]}{tui.RESET}')
+    print()
+
+
+def cmd_details(a):
+    from . import play, tui
+    d = play.details(a.package)
+    if a.json:
+        print(json.dumps(d["raw"] if a.raw else d, indent=2, default=str))
+        return
+    raw, norm = d["raw"], d["normalised"]
+    print(f'\n  {tui.BOLD}{tui.WHITE}{raw.get("title")}{tui.RESET}'
+          f'{tui.FAINT}  {norm["pkg"]}{tui.RESET}')
+    print(f'  {tui.rule()}\n')
+    for label, shown, parsed in (
+            ("installs", raw.get("installs"), f'{norm["installs"]:,}'),
+            ("rating", raw.get("score"), f'{norm["rating"]}'),
+            ("ratings", raw.get("ratings_count"), f'{norm["reviews"]:,}'),
+            ("released", raw.get("released"), norm["released_at"] or "unparsed"),
+            ("updated", raw.get("updated"), norm["updated_at"] or "unparsed")):
+        print(f'  {tui.GRAY}{label:<10}{tui.RESET}{tui.WHITE}{str(shown or "-"):<22}'
+              f'{tui.RESET}{tui.FAINT}read as {parsed}{tui.RESET}')
+    print(f'\n  {tui.GRAY}{"developer":<10}{tui.RESET}{raw.get("developer") or "-"}')
+    if raw.get("short_description"):
+        print(f'  {tui.GRAY}{"tagline":<10}{tui.RESET}{raw["short_description"][:56]}')
+    print()
+
+
+def cmd_publisher(a):
+    from . import play, tui
+    out = play.publisher(a.developer)
+    if a.json:
+        print(json.dumps(out, indent=2))
+        return
+    print(f'\n  {tui.FAINT}{len(out)} apps for {a.developer!r} '
+          f'(Play search caps near 50){tui.RESET}\n')
+    for r in out:
+        print(f'  {tui.WHITE}{(r.get("title") or "")[:36]:<36}{tui.RESET}'
+              f'{tui.FAINT}{r.get("package", "")}{tui.RESET}')
+    print(f'\n  {tui.FAINT}for the full catalogue: '
+          f'python scripts/fetch_publisher.py "{a.developer}" --json apps.json{tui.RESET}\n')
+
+
 def cmd_serve(a):
-    from . import server
-    server.serve(a.host, a.port)
+    """Run the API under uvicorn."""
+    import socket
+
+    import uvicorn
+
+    from . import api, config, server
+
+    if a.max_concurrent:
+        api._gate.resize(a.max_concurrent)
+    if a.timeout:
+        api._limits["timeout"] = a.timeout
+
+    explicit = a.port is not None
+    port = a.port if explicit else server.PORT
+    strict = explicit and not a.auto_port
+
+    def free(p):
+        with socket.socket() as sk:
+            sk.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sk.bind((a.host, p))
+                return True
+            except OSError:
+                return False
+
+    if not free(port):
+        if strict:
+            raise SystemExit(
+                f"port {port} is taken.\n"
+                f"  You asked for this port specifically, so it was not moved.\n"
+                f"  aso serve --port {port} --auto-port   move up if busy\n"
+                f"  aso serve                            use the default, "
+                f"{server.PORT}")
+        found = next((p for p in range(port + 1, port + 21) if free(p)), None)
+        if found is None:
+            raise SystemExit(f"no free port between {port + 1} and {port + 20}")
+        print(f"  port {port} taken, using {found}")
+        port = found
+
+    if (a.host not in ("127.0.0.1", "localhost", "::1") and not api.API_TOKEN
+            and not os.environ.get("ASO_ALLOW_INSECURE")):
+        raise SystemExit(
+            f"refusing to bind {a.host} without ASO_API_TOKEN.\n"
+            f"  This server scrapes, trains and writes to the database, so a\n"
+            f"  reachable port hands a stranger write access.\n\n"
+            f"  Set it in .env:   ASO_API_TOKEN=$(openssl rand -hex 24)\n"
+            f"  Or, if the port is genuinely private (a container network that\n"
+            f"  nothing outside can reach):   ASO_ALLOW_INSECURE=1")
+
+    server.write_runfile(a.host, port)
+    print(f"  http://{a.host}:{port}   docs at /docs")
+    try:
+        uvicorn.run(api.app, host=a.host, port=port, log_level="warning",
+                    timeout_keep_alive=65)
+    finally:
+        server.RUNFILE.unlink(missing_ok=True)
 
 
 def cmd_train(a):
@@ -913,9 +1054,46 @@ def main(argv=None):
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_why)
 
+    s = sub.add_parser("suggest", help="Play autocomplete for a query")
+    s.add_argument("query")
+    s.add_argument("--games", action="store_true")
+    s.add_argument("--no-cache", action="store_true",
+                   help="fetch fresh and update the cache, ignoring the TTL")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_suggest)
+
+    s = sub.add_parser("search", help="top results for a query, with organic ranks")
+    s.add_argument("query")
+    s.add_argument("--details", action="store_true", help="also fetch each listing")
+    s.add_argument("--limit", type=int)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_search)
+
+    s = sub.add_parser("details", help="full listing for one app")
+    s.add_argument("package", help="package name or Play Store URL")
+    s.add_argument("--raw", action="store_true", help="Play's fields, unnormalised")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_details)
+
+    s = sub.add_parser("publisher", help="apps by a developer (Play search, caps at ~50)")
+    s.add_argument("developer")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_publisher)
+
     s = sub.add_parser("serve", help="load the model once and answer over HTTP")
     s.add_argument("--host", default="127.0.0.1")
-    s.add_argument("--port", type=int, default=8765)
+    # No default: whether --port was PASSED is the signal. Naming a port means
+    # you want that port, so it is used or the start fails. Saying nothing means
+    # you do not care, so a busy default quietly moves up.
+    s.add_argument("--port", type=int, metavar="N",
+                   help="use this exact port (fails if taken). "
+                        "Omit for 8765, which moves up if busy")
+    s.add_argument("--max-concurrent", type=int,
+                   help="requests served at once (default: config, or 4)")
+    s.add_argument("--timeout", type=float,
+                   help="seconds before a request returns 504 (default: 180)")
+    s.add_argument("--auto-port", action="store_true",
+                   help="with --port, allow moving to the next free one anyway")
     s.set_defaults(fn=cmd_serve)
 
     s = sub.add_parser("train")

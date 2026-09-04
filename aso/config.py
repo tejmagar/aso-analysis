@@ -43,6 +43,14 @@ DEFAULTS: dict = {
     "track_every_days": 7,     # `aso track` re-scrapes anything older than this
     "new_app_years": 1.5,      # released within this is an entry experiment
     "scrape_sleep": 0.7,
+    # Autocomplete changes slowly, so a day-old list is almost always current.
+    "suggest_ttl_hours": 24,
+
+    # --- server -----------------------------------------------------------
+    # Small on purpose: a cold keyword holds its slot for ~40s of scraping, and
+    # unbounded threads means concurrent scrapes that Play rate-limits.
+    "server_max_concurrent": 4,
+    "server_timeout": 180,
 }
 
 PATHS = [

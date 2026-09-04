@@ -14,6 +14,7 @@ import numpy as np
 from . import db, embed, features, history, intent, suggest
 
 TOP_K = 10          # "ranks" means reaching the top 10
+NEW_APP_YEARS = 1.5  # only these carry a meaningful installs-per-year label
 
 
 def build(con, country: str = "us", top_n: int = TOP_K):
@@ -47,12 +48,20 @@ def build(con, country: str = "us", top_n: int = TOP_K):
                               r.get("description") or "")
             feats.append(features.extract(r, kw, fld, kv, av, sg))
             labels.append(1.0 if r["position"] <= top_n else 0.0)
-            # The downloads label, free from data already scraped: what this app
-            # actually achieved per year since release. NaN when the release
-            # date is unknown, and masked out of the loss rather than guessed.
+            # The downloads label: what this app achieved per year since release.
+            #
+            # Only NEW apps carry it. For an eight-year-old app the same
+            # arithmetic gives a LIFETIME average earned over years of already
+            # ranking - median 168,848/yr against 4,947/yr for a newcomer, a 34x
+            # gap. Training on both taught the head to answer "what do apps in
+            # this slot have" when the question is "what would a new app get",
+            # and it forecast 57,000 downloads a day for an unlaunched app.
+            #
+            # NaN is masked out of the loss, so old rows still train the RANK
+            # head and simply contribute nothing to the downloads head.
             age = features._days_since(r.get("released_at")) / 365.0
             vel.append(math.log1p((r.get("installs") or 0) / max(age, 0.25))
-                       if age > 0 else float("nan"))
+                       if 0 < age <= NEW_APP_YEARS else float("nan"))
             groups.append(kw)
             meta.append({"pkg": r["pkg"], "keyword": kw, "position": r["position"],
                          "source": r["source"],

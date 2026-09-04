@@ -78,10 +78,10 @@ def analyze(con, keyword, country="us", pkg=None, refresh_demand=True, verbose=T
     ranked = sorted((r for r in rows if r.get("position")), key=lambda r: r["position"])
 
     from . import suggest as sugg_mod
-    if refresh_demand and not sugg_mod.get(con, keyword, country):
+    if refresh_demand and not sugg_mod.is_fresh(con, keyword, country):
         from . import ui
         with ui.Task("reading Play autocomplete", quiet=not verbose) as t:
-            got = sugg_mod.refresh(con, keyword, country)
+            got = sugg_mod.ensure(con, keyword, country)
             t.done(f"{len(got)} suggestions returned")
     sg = sugg_mod.signals(con, keyword, country)
 

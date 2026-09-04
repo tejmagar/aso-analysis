@@ -379,10 +379,17 @@ def test_model_always_predicts():
     con.execute("DELETE FROM registry")
     con.commit()
     model, blob, version = T.load_active(con)
-    check("a model is created from random weights on first use",
-          model is not None and version == "v0")
-    check("it is marked untrained rather than pretending to be fitted",
-          blob["meta"].get("untrained") is True)
+    check("a model is always available, even with an empty registry",
+          model is not None, f"got {version}")
+    # Load order: what this machine trained, then the checkpoint shipped with
+    # the repo, then random weights. A fresh clone lands on the shipped one.
+    if T.SHIPPED.exists():
+        check("an empty registry falls back to the shipped checkpoint",
+              blob["meta"].get("untrained") is not True,
+              f"loaded {version}")
+    else:
+        check("with no shipped checkpoint it bootstraps from random weights",
+              blob["meta"].get("untrained") is True and version == "v0")
     check("its feature list matches the registry",
           blob["meta"]["features"] == [f.name for f in features.REGISTRY])
 
