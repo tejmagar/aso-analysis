@@ -482,6 +482,20 @@ def suggest(body: Query):
             "age_hours": None if age is None else round(age, 2)}
 
 
+@app.post("/expand", dependencies=[Depends(auth)],
+          summary="the whole keyword family, not just the first ten")
+def expand(body: Query):
+    """Autocomplete answers a prefix, so one query returns the ten commonest
+    completions and hides the tail. This asks a seed per letter and unions the
+    answers, which is slow the first time and cached afterwards."""
+    from . import suggest as sugg_mod
+    _state["requests"] += 1
+    with _gate.slot(), session() as con:
+        return sugg_mod.expand(con, body.keyword,
+                               country=config.get("country", "us"),
+                               ttl_hours=0 if body.no_cache else 24.0)
+
+
 @app.post("/search", dependencies=[Depends(auth)])
 def search(body: Query):
     from . import play

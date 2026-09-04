@@ -122,3 +122,117 @@ def detail(con, keyword: str, country: str = "us") -> dict:
         "extends": [s for s in sugg if s != kw and kw in s],
         "unrelated": [s for s in sugg if kw not in s],
     }
+
+
+# ---------------------------------------------------------------- expansion
+
+ALPHABET = "abcdefghijklmnopqrstuvwxyz"
+
+
+def _seeds(kw: str) -> list[str]:
+    """The queries to ask Play for, to see past the ten it returns for one.
+
+    Autocomplete answers a prefix, so asking for the phrase alone shows only the
+    ten most common completions of it. Appending each letter in turn asks
+    twenty-six narrower questions and returns the tail that the first answer hid:
+    'habit tracker a' surfaces 'habit tracker app', which 'habit tracker' on its
+    own never showed.
+
+    The head of a multi-word phrase is expanded too. 'habit ' finds the siblings
+    that share the subject but not the whole phrase, which is where a keyword
+    that is genuinely open usually lives.
+    """
+    out = [kw] + [f"{kw} {c}" for c in ALPHABET]
+    words = kw.split()
+    if len(words) > 1:
+        head = " ".join(words[:-1])
+        out += [head] + [f"{head} {c}" for c in ALPHABET]
+    return out
+
+
+class Trie:
+    """A prefix tree over the harvested phrases, read one level at a time.
+
+    A flat union of several hundred completions is a wall. What a reader wants
+    is the shape: which words follow the phrase, and how much sits under each.
+    A trie answers that directly, and `branches` reads the level below a prefix
+    rather than walking the whole set per question.
+    """
+
+    __slots__ = ("kids", "count", "terminal")
+
+    def __init__(self):
+        self.kids: dict[str, Trie] = {}
+        self.count = 0
+        self.terminal = False
+
+    def add(self, words: list[str]) -> None:
+        node = self
+        node.count += 1
+        for w in words:
+            node = node.kids.setdefault(w, Trie())
+            node.count += 1
+        node.terminal = True
+
+    def walk(self, words: list[str]):
+        node = self
+        for w in words:
+            node = node.kids.get(w)
+            if node is None:
+                return None
+        return node
+
+    def branches(self, prefix: list[str]) -> list[tuple[str, int]]:
+        """The next words under a prefix, commonest first."""
+        node = self.walk(prefix)
+        if node is None:
+            return []
+        return sorted(((w, k.count) for w, k in node.kids.items()),
+                      key=lambda t: (-t[1], t[0]))
+
+
+def expand(con, keyword: str, country: str = "us", ttl_hours: float = 24.0) -> dict:
+    """Harvest the keyword family, and describe its shape.
+
+    Every seed is cached like any other suggestion query, so a second look at
+    the same keyword costs nothing and a first one costs one request per seed.
+    """
+    kw = " ".join(keyword.strip().lower().split())
+    words = kw.split()
+    found: set[str] = set()
+
+    for seed in _seeds(kw):
+        age = age_hours(con, seed, country)
+        if age is None or age > ttl_hours:
+            try:
+                refresh(con, seed, country)
+            except Exception:                   # noqa: BLE001 - one dead seed is not fatal
+                continue
+        found.update(get(con, seed, country))
+
+    found.discard(kw)
+    trie = Trie()
+    for phrase in found:
+        trie.add(phrase.split())
+
+    # Three groups, and the order is the order they are worth reading in.
+    longer = sorted(p for p in found if p.startswith(kw + " "))
+    contains = sorted(p for p in found
+                      if kw in p and p not in longer and p != kw)
+    head = " ".join(words[:-1]) if len(words) > 1 else words[0]
+    siblings = sorted(p for p in found
+                      if p not in longer and p not in contains
+                      and (p.startswith(head + " ") or p == head))
+    rest = sorted(found - set(longer) - set(contains) - set(siblings))
+
+    return {
+        "query": kw,
+        "found": len(found),
+        # What word most often follows the phrase, which is the fastest read on
+        # where the family actually goes.
+        "next_words": [{"word": w, "n": n} for w, n in trie.branches(words)][:12],
+        "longer": longer,
+        "contains": contains,
+        "siblings": siblings,
+        "other": rest,
+    }
