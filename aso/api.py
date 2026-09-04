@@ -1,7 +1,7 @@
 """The HTTP API, on FastAPI.
 
 Every endpoint is a plain `def`, not `async def`, on purpose: the work is
-blocking (torch, sqlite, scraping over the network) and FastAPI runs sync
+blocking (torch, the database, scraping over the network) and FastAPI runs sync
 handlers in a threadpool. Declaring them async would run them on the event loop
 and block every other request for the ~40 seconds a cold keyword takes.
 
@@ -192,7 +192,7 @@ def health():
 @app.get("/status", dependencies=[Depends(auth)])
 def status():
     with session() as con:
-        q = lambda s: con.execute(s).fetchone()[0]
+        q = lambda s: db.scalar(con, s)
         return {"apps": q("SELECT COUNT(*) FROM apps"),
                 "keywords": q("SELECT COUNT(DISTINCT keyword) FROM observations"),
                 "ranked": q("SELECT COUNT(*) FROM observations "
@@ -280,7 +280,7 @@ def correct(body: Correct):
 
 
 # Training runs in a background thread and reports through this. It holds the
-# sqlite write lock only for the moment it registers the model, so analysis
+# write lock only for the moment it registers the model, so analysis
 # keeps working on the current weights throughout - a fit takes ~30s and
 # blocking every caller for it would make the tool feel broken.
 _job: dict = {"state": "idle", "started": None, "finished": None,
@@ -291,8 +291,11 @@ _job_lock = threading.Lock()
 # Progress is mirrored to a file as well as held in memory. The API process can
 # be restarted, and a run started from a chat should still be explicable
 # afterwards rather than vanishing with the process that owned it.
-PROGRESS = Path(os.environ.get("ASO_TRAIN_PROGRESS",
-                               Path(db.DB_PATH).parent / "training.txt"))
+# It used to sit beside the SQLite file. The database is remote now, so it goes
+# where the other rebuildable local artefacts do, next to the embedding cache.
+PROGRESS = Path(os.environ.get(
+    "ASO_TRAIN_PROGRESS",
+    Path(os.environ.get("ASO_EMBED_CACHE", "data/emb")).parent / "training.txt"))
 
 
 def _write_progress() -> None:

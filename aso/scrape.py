@@ -215,13 +215,14 @@ def scrape_keyword(con, keyword: str, country="us", lang="en",
                         bool(r.get("featured"))))
         n += pos is not None
 
-    with con:                                  # one transaction, milliseconds
+    with con.transaction():                                  # one transaction, milliseconds
         for row, pos, is_featured in pending:
             db.upsert_app(con, row)
             con.execute(
-                "INSERT OR IGNORE INTO observations "
+                "INSERT INTO observations "
                 "(keyword, country, pkg, position, source, featured, observed_at) "
-                "VALUES (?,?,?,?,?,?,?)",
+                "VALUES (%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (keyword, country, pkg, observed_at) DO NOTHING",
                 (keyword, country, row["pkg"], pos, "serp", int(is_featured),
                  observed_at))
 

@@ -943,7 +943,7 @@ def cmd_train(a):
 
 def cmd_status(a):
     con = db.connect()
-    q = lambda s: con.execute(s).fetchone()[0]
+    q = lambda s: db.scalar(con, s)
     stats = {
         "apps": q("SELECT COUNT(*) FROM apps"),
         "keywords": q("SELECT COUNT(DISTINCT keyword) FROM observations"),

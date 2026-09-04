@@ -153,21 +153,26 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
     regressed = measurable and prev is not None and g_auc < prev["golden_auc"] - 0.01
     no_signal = measurable and g_auc < MIN_AUC
     gated = regressed or no_signal
-    version = f"v{con.execute('SELECT COUNT(*) FROM registry').fetchone()[0] + 1}"
+    version = f"v{db.scalar(con, 'SELECT COUNT(*) FROM registry') + 1}"
     path = MODELS / f"{version}.pt"
     model.save(path, sm.state(), sf.state(), meta)
 
-    with con:
+    with con.transaction():
         con.execute("INSERT INTO registry (version, path, created_at, n_rows, "
-                    "golden_auc, golden_ece, active) VALUES (?,?,?,?,?,?,0)",
+                    "golden_auc, golden_ece, active) VALUES (%s,%s,%s,%s,%s,%s,0)",
                     (version, str(path), db.now(), len(y), g_auc, g_ece))
         if not gated:
             con.execute("UPDATE registry SET active=0")
-            con.execute("UPDATE registry SET active=1 WHERE version=?", (version,))
+            con.execute("UPDATE registry SET active=1 WHERE version=%s", (version,))
             # Keep the shipped checkpoint pointing at whatever is actually
-            # serving, so committing it never publishes a model the gate rejected.
-            model.save(SHIPPED, sm.state(), sf.state(),
-                       {**meta, "version": version, "promoted_at": db.now()})
+            # serving, so committing it never publishes a model the gate
+            # rejected. Only from a run whose held-out split means something:
+            # a handful of keywords promotes unconditionally, because there is
+            # nothing to regress against, and the test suite's synthetic fixture
+            # was quietly overwriting the checkpoint a fresh clone would get.
+            if measurable:
+                model.save(SHIPPED, sm.state(), sf.state(),
+                           {**meta, "version": version, "promoted_at": db.now()})
             con.execute("UPDATE corrections SET status='absorbed' WHERE status='queued'")
             _retire_learned(con, model, sm, sf)
 
@@ -217,9 +222,11 @@ def bootstrap(con, k=7, hidden=24):
     version = "v0"
     path = MODELS / "v0.pt"
     model.save(path, ident, identf, meta)
-    with con:
-        con.execute("INSERT OR REPLACE INTO registry (version, path, created_at, "
-                    "n_rows, golden_auc, golden_ece, active) VALUES (?,?,?,0,0.5,0.5,1)",
+    with con.transaction():
+        con.execute("INSERT INTO registry (version, path, created_at, "
+                    "n_rows, golden_auc, golden_ece, active) VALUES (%s,%s,%s,0,0.5,0.5,1) "
+                    "ON CONFLICT (version) DO UPDATE SET path=excluded.path, "
+                    "created_at=excluded.created_at, active=excluded.active",
                     (version, str(path), db.now()))
     return model, {"cfg": model.cfg, "scaler_mono": ident, "scaler_free": identf,
                    "meta": meta}, version

@@ -71,7 +71,7 @@ def outcomes(con, country="us") -> dict[str, int | None]:
     rows = con.execute("""
         SELECT o.keyword, MIN(o.position) AS pos
         FROM observations o
-        WHERE o.country = ?
+        WHERE o.country = %s
           AND (o.source IN ('owned', 'review')
                OR o.pkg IN (SELECT pkg FROM apps
                             WHERE developer LIKE 'Flash%' OR developer LIKE 'Monova%'))
@@ -89,7 +89,7 @@ def snapshot_pairs(con, country="us", min_gap_days=7) -> list[dict]:
     rows = con.execute("""
         SELECT keyword, COUNT(DISTINCT substr(observed_at, 1, 10)) AS days,
                MIN(observed_at) AS first, MAX(observed_at) AS last
-        FROM observations WHERE country = ? GROUP BY keyword HAVING days > 1""",
+        FROM observations WHERE country = %s GROUP BY keyword HAVING days > 1""",
         (country,)).fetchall()
     out = []
     for r in rows:

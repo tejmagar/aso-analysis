@@ -19,7 +19,7 @@ NEW_APP_YEARS = 1.5  # only these carry a meaningful installs-per-year label
 
 def build(con, country: str = "us", top_n: int = TOP_K):
     kws = [r["keyword"] for r in con.execute(
-        "SELECT DISTINCT keyword FROM observations WHERE country=?", (country,))]
+        "SELECT DISTINCT keyword FROM observations WHERE country=%s", (country,))]
     by_kw: dict[str, list[dict]] = {}
     for kw in kws:
         rs = db.ranked_field(con, kw, country)   # consistent slots, no collisions
@@ -35,7 +35,8 @@ def build(con, country: str = "us", top_n: int = TOP_K):
                 for x in rs + feat_rows}
         sg = suggest.signals(con, kw, country)     # reads stored rows only
         sg = {**sg, **history.deltas(con, kw, country,
-                                     features.compute_field(rs, kw, top_n=top_n))}
+                                     features.compute_field(rs, kw, top_n=top_n),
+                                     rows_today=rs)}
         split = intent.split(rs, vecs, kv)
         for r in rs:
             fld = features.compute_field(
@@ -99,15 +100,16 @@ def fixed_holdout(con, groups, country="us", frac=0.25, seed=0):
     the same test as the dataset grows.
     """
     have = {r["keyword"] for r in con.execute(
-        "SELECT keyword FROM holdout WHERE country=?", (country,))}
+        "SELECT keyword FROM holdout WHERE country=%s", (country,))}
     uniq = list(np.unique(groups))
     if not have:
         rng = np.random.default_rng(seed)
         pick = list(rng.permutation(uniq)[:max(1, int(len(uniq) * frac))])
-        with con:
+        with con.transaction():
             for kw in pick:
-                con.execute("INSERT OR IGNORE INTO holdout (keyword, country, "
-                            "chosen_at) VALUES (?,?,?)", (str(kw), country, db.now()))
+                con.execute("INSERT INTO holdout (keyword, country, chosen_at) "
+                            "VALUES (%s,%s,%s) ON CONFLICT (keyword, country) "
+                            "DO NOTHING", (str(kw), country, db.now()))
         have = set(map(str, pick))
     mask = np.array([g in have for g in groups])
     return ~mask, mask

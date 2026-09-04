@@ -28,7 +28,7 @@ def _feature_vectors(con, keyword: str, pkg: str, country: str = "us"):
     rows = predict.field_rows(con, keyword, country)
     if not rows:
         raise SystemExit(f"no SERP on file for {keyword!r}")
-    app = con.execute("SELECT * FROM apps WHERE pkg=?", (pkg,)).fetchone()
+    app = con.execute("SELECT * FROM apps WHERE pkg=%s", (pkg,)).fetchone()
     if app is None:
         raise SystemExit(f"unknown app {pkg!r}")
     app = dict(app)

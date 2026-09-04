@@ -54,7 +54,7 @@ def score(con, pkg: str, keyword: str, country="us", record=True):
         raise SystemExit("no model yet. Run: aso train")
 
     keyword = keyword.strip().lower()
-    app = con.execute("SELECT * FROM apps WHERE pkg=?", (pkg,)).fetchone()
+    app = con.execute("SELECT * FROM apps WHERE pkg=%s", (pkg,)).fetchone()
     if app is None:
         raise SystemExit(f"unknown app {pkg!r}. Scrape a keyword it ranks for first.")
     app = dict(app)
@@ -119,11 +119,11 @@ def score(con, pkg: str, keyword: str, country="us", record=True):
         "inc_logits": sorted(inc_logits.tolist(), reverse=True),
     }
     if record:
-        with con:
+        with con.transaction():
             con.execute(
                 "INSERT INTO predictions (id, ts, model_version, pkg, keyword, country, "
                 "chance, uncertainty, crowding, fit, logit, features_json) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (out["prediction_id"], db.now(), version, pkg, keyword, country,
                  chance, 0.0, out["crowding"], out["fit"], logit,
                  json.dumps(out["raw"])))
@@ -181,7 +181,8 @@ def score_entry(con, keyword: str, country="us"):
 
     sg = suggest.signals(con, keyword, country)
     sg = {**sg, **history.deltas(con, keyword, country,
-                                 features.compute_field(rows, keyword, top_n=TOP_K))}
+                                 features.compute_field(rows, keyword, top_n=TOP_K),
+                                 rows_today=rows)}
     split = intent.split(rows, vecs, kv)
     feats = [_feat_for(r, keyword, rows, kv, featured, vecs, sg, split) for r in ranked]
     ghost_feat = _feat_for(ghost, keyword, rows, kv, featured, vecs, sg, split)

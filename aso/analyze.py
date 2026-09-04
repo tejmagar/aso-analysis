@@ -173,8 +173,8 @@ def analyze(con, keyword, country="us", pkg=None, refresh_demand=True, verbose=T
     if intents.get("groups"):
         out["_your_group"] = max(intents["groups"], key=lambda g: g["affinity"])
 
-    kw_total = con.execute(
-        "SELECT COUNT(DISTINCT keyword) FROM observations").fetchone()[0]
+    kw_total = db.scalar(
+        con, "SELECT COUNT(DISTINCT keyword) FROM observations")
     reg = con.execute("SELECT n_rows FROM registry WHERE active=1").fetchone()
     out["trained_on"] = {"keywords": kw_total,
                          "rows": (reg["n_rows"] if reg else 0) or 0,

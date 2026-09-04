@@ -1,10 +1,11 @@
 # CPU-only torch: the GPU wheel is ~2.5GB and this project never uses it.
 FROM python:3.12-slim AS base
 
+# The database is Postgres now and its address comes from the environment;
+# /data keeps only the embedding cache, which is a rebuildable artefact.
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     HF_HOME=/models \
-    ASO_DB=/data/aso.db \
     ASO_EMBED_CACHE=/data/emb
 
 # git: the Play Store reader installs from a repo, not PyPI.
@@ -18,10 +19,10 @@ COPY pyproject.toml README.md ./
 RUN pip install torch --index-url https://download.pytorch.org/whl/cpu \
     && pip install "fastapi" "uvicorn[standard]" \
     && pip install "google-play-api-unofficial @ git+https://github.com/tejmagar/google-play-api-unofficial" \
-    && pip install sentence-transformers
+    && pip install sentence-transformers "psycopg[binary]"
 
 COPY aso/ ./aso/
-COPY schema.sql ./
+COPY schema_pg.sql ./
 COPY models/ ./models/
 RUN pip install -e . --no-deps
 

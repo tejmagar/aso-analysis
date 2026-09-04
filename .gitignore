@@ -14,3 +14,6 @@ data/
 # data/models/ stays out.
 !models/
 !models/latest.pt
+
+# Secrets: never committed.
+.env

@@ -120,7 +120,7 @@ def pending(con, todo: list[dict], country: str = "us",
     """
     seen = {r["keyword"]: r["last"] for r in con.execute(
         "SELECT keyword, MAX(observed_at) AS last FROM observations "
-        "WHERE country=? GROUP BY keyword", (country,))}
+        "WHERE country=%s GROUP BY keyword", (country,))}
     from .history import _days
     now = db.now()
     return [t for t in todo
@@ -165,7 +165,7 @@ def run(con, limit: int | None = None, sleep: float = 0.8,
             continue
 
         found = con.execute(
-            "SELECT position FROM observations WHERE keyword=? AND pkg=? "
+            "SELECT position FROM observations WHERE keyword=%s AND pkg=%s "
             "AND position IS NOT NULL ORDER BY observed_at DESC LIMIT 1",
             (kw, t["pkg"])).fetchone()
         if found:
@@ -188,7 +188,7 @@ def run(con, limit: int | None = None, sleep: float = 0.8,
             if detail:
                 db.upsert_app(con, to_app_row(detail, country, lang))
             else:
-                existing = con.execute("SELECT pkg FROM apps WHERE pkg=?",
+                existing = con.execute("SELECT pkg FROM apps WHERE pkg=%s",
                                        (t["pkg"],)).fetchone()
                 if not existing:
                     db.upsert_app(con, {"pkg": t["pkg"], "title": t["title"] or "",

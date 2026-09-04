@@ -97,7 +97,7 @@ def write(con, correction_id, keyword, x: np.ndarray, pkg: str | None,
     compensated = (target_logit - predicted_logit) * (weight + SHRINK) / weight
     cur = con.execute(
         "INSERT INTO residuals (ts, correction_id, keyword, pkg, features_json, "
-        "residual, target_logit, weight) VALUES (?,?,?,?,?,?,?,?)",
+        "residual, target_logit, weight) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
         (now(), correction_id, keyword, pkg, json.dumps([float(v) for v in x]),
          float(compensated), float(target_logit), float(weight)))
     con.commit()
@@ -126,7 +126,7 @@ def retire_stale(con, n_features: int) -> int:
         if len(json.loads(r["features_json"])) != n_features]
     if stale:
         q = ",".join("?" * len(stale))
-        con.execute(f"UPDATE residuals SET retired_at=? WHERE id IN ({q})",
+        con.execute(f"UPDATE residuals SET retired_at=%s WHERE id IN ({q})",
                     (now(), *stale))
         con.commit()
     return len(stale)
@@ -141,11 +141,11 @@ def retire(con, ids: list[int] | None = None) -> int:
     train and the answer reverted."""
     from .db import now
     if ids is None:
-        cur = con.execute("UPDATE residuals SET retired_at=? WHERE retired_at IS NULL", (now(),))
+        cur = con.execute("UPDATE residuals SET retired_at=%s WHERE retired_at IS NULL", (now(),))
     else:
         q = ",".join("?" * len(ids))
         cur = con.execute(
-            f"UPDATE residuals SET retired_at=? WHERE id IN ({q}) AND retired_at IS NULL",
+            f"UPDATE residuals SET retired_at=%s WHERE id IN ({q}) AND retired_at IS NULL",
             (now(), *ids))
     con.commit()
     return cur.rowcount

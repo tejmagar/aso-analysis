@@ -1,66 +1,92 @@
-"""SQLite access. One file, no ORM, no migrations framework."""
+"""Postgres access. One schema file, no ORM, no migrations framework.
+
+Ported from SQLite. The table and column names did not change, so most SQL is
+the same statement with a different placeholder; the handful of SQLite-only
+constructs are rewritten and each is marked where it appears.
+
+Connections run with autocommit on. Under SQLite a bare `con.execute("INSERT
+...")` committed by itself, and roughly fifty call sites rely on that; leaving
+autocommit off would make every one of them a write that vanishes when the
+connection closes. Where several statements have to land together they say so
+explicitly with `con.transaction()`, which is atomic whether or not autocommit
+is set.
+"""
 from __future__ import annotations
 
 import json
 import os
-import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+import psycopg
+from psycopg.rows import dict_row
+
 ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = Path(os.environ.get("ASO_DB", ROOT / "data" / "aso.db"))
-SCHEMA = ROOT / "schema.sql"
+SCHEMA = ROOT / "schema_pg.sql"
+
+DSN_ENV = "ASO_PG_DSN"
 
 ABSENT = 251  # checked and not in the top 250
-BUSY_TIMEOUT = 20.0   # seconds a writer waits for the lock before giving up
+CONNECT_TIMEOUT = 20   # seconds to wait for the server before giving up
+
+_READY = False
+
+
+def dsn() -> str:
+    v = os.environ.get(DSN_ENV)
+    if not v:
+        raise SystemExit(
+            f"{DSN_ENV} is not set.\n"
+            f"  export {DSN_ENV}=postgresql://user:password@host:5470/aso")
+    return v
 
 
 def now() -> str:
     """Microsecond precision, deliberately. observations is UNIQUE on
-    (keyword, country, pkg, observed_at) with INSERT OR IGNORE, so a
+    (keyword, country, pkg, observed_at) and inserts ignore conflicts, so a
     second-resolution stamp lets a reviewed rank filed in the same second as a
     scrape be silently dropped, and the correction vanishes without a trace."""
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
-def connect(path: Path | None = None) -> sqlite3.Connection:
-    """Opens, and creates the schema on first use. There is no `init` step to
-    forget: any command works against a fresh checkout."""
-    path = Path(path or DB_PATH)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(path, timeout=BUSY_TIMEOUT)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA foreign_keys=ON")
-    # Wait for a busy writer instead of failing instantly. Without this a second
-    # command raises "database is locked" the moment two things overlap, which
-    # is constantly: analyze scrapes, train writes, the server serves.
-    con.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT * 1000)}")
+def scalar(con, sql: str, params=()):
+    """The first column of the first row, or None.
 
-    # Create the schema only when it is actually missing.
-    #
-    # Running the script on every connect looked harmless because every
-    # statement is IF NOT EXISTS - but DDL opens a WRITE transaction, and
-    # python's sqlite3 does not commit it until something else does. So every
-    # connection sat holding the write lock for its whole life, and a 40-second
-    # scrape blocked every other command with "database is locked". The
-    # busy_timeout above never helped, because the holder never let go.
-    have = con.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='observations'"
-    ).fetchone()
-    if not have:
-        con.executescript(SCHEMA.read_text())
-        con.commit()
+    Rows come back as dicts, so `fetchone()[0]` no longer works. Wrapping it
+    here keeps the call sites reading as the counting queries they are, rather
+    than each inventing its own column alias.
+    """
+    row = con.execute(sql, params).fetchone()
+    return None if row is None else next(iter(row.values()))
+
+
+def connect(url: str | None = None):
+    """Open a connection, creating the schema the first time in this process.
+
+    The schema is applied once per process rather than once per connection: it
+    is thirteen CREATE TABLE IF NOT EXISTS statements, and running them on every
+    connect is pure round trips against a server that is not local.
+    """
+    global _READY
+    con = psycopg.connect(url or dsn(), row_factory=dict_row,
+                          autocommit=True, connect_timeout=CONNECT_TIMEOUT)
+    if not _READY:
+        exists = con.execute("SELECT to_regclass('public.observations') IS NOT NULL AS ok"
+                             ).fetchone()["ok"]
+        if not exists:
+            con.execute(SCHEMA.read_text())
+        _READY = True
     return con
 
 
-def init(path: Path | None = None) -> Path:
-    con = connect(path)
-    with con:
-        con.executescript(SCHEMA.read_text())
+def init(url: str | None = None) -> str:
+    """Apply the schema explicitly. Every statement is IF NOT EXISTS, so this is
+    safe to re-run and there is no migration step to remember."""
+    con = connect(url)
+    con.execute(SCHEMA.read_text())
     con.close()
-    return Path(path or DB_PATH)
+    return url or dsn()
 
 
 def upsert_app(con, app: dict) -> None:
@@ -69,7 +95,7 @@ def upsert_app(con, app: dict) -> None:
     row = {c: app.get(c) for c in cols}
     row["scraped_at"] = row["scraped_at"] or now()
     row["raw_json"] = row["raw_json"] or json.dumps(app, default=str)
-    placeholders = ",".join(f":{c}" for c in cols)
+    placeholders = ",".join(f"%({c})s" for c in cols)
     updates = ",".join(f"{c}=excluded.{c}" for c in cols if c != "pkg")
     con.execute(
         f"INSERT INTO apps ({','.join(cols)}) VALUES ({placeholders}) "
@@ -79,8 +105,9 @@ def upsert_app(con, app: dict) -> None:
 def add_observation(con, keyword, pkg, position, country="us",
                     source="serp", observed_at=None) -> None:
     con.execute(
-        "INSERT OR IGNORE INTO observations "
-        "(keyword, country, pkg, position, source, observed_at) VALUES (?,?,?,?,?,?)",
+        "INSERT INTO observations "
+        "(keyword, country, pkg, position, source, observed_at) VALUES (%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (keyword, country, pkg, observed_at) DO NOTHING",
         (keyword.strip().lower(), country, pkg, position, source, observed_at or now()))
 
 
@@ -88,6 +115,7 @@ def latest_observations(con, country="us"):
     """Most recent observation per (keyword, pkg). Older snapshots stay for history."""
     # Newest row per (keyword, pkg), ties broken by insertion order so "latest"
     # is deterministic. A reviewed rank filed after a scrape supersedes it.
+    # The derived table carries an alias because Postgres requires one.
     return con.execute("""
         SELECT o.keyword, o.pkg, o.position, o.source, o.featured, o.observed_at, a.*
         FROM observations o
@@ -98,24 +126,24 @@ def latest_observations(con, country="us"):
                     PARTITION BY keyword, pkg
                     ORDER BY observed_at DESC, id DESC) AS rn
                 FROM observations
-                WHERE country = ? AND position IS NOT NULL
-            ) WHERE rn = 1
+                WHERE country = %s AND position IS NOT NULL
+            ) ranked WHERE rn = 1
         )
     """, (country,)).fetchall()
 
 
 def set_override(con, keyword, field, value, country="us", reviewer="you") -> None:
-    with con:
-        con.execute(
-            "INSERT INTO overrides (keyword, country, field, value, reviewer, ts) "
-            "VALUES (?,?,?,?,?,?) ON CONFLICT(keyword, country, field) DO UPDATE SET "
-            "value=excluded.value, reviewer=excluded.reviewer, ts=excluded.ts",
-            (keyword.strip().lower(), country, field, float(value), reviewer, now()))
+    con.execute(
+        "INSERT INTO overrides (keyword, country, field, value, reviewer, ts) "
+        "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT(keyword, country, field) DO UPDATE SET "
+        "value=excluded.value, reviewer=excluded.reviewer, ts=excluded.ts",
+        (keyword.strip().lower(), country, field, float(value), reviewer, now()))
 
 
 def get_override(con, keyword, field, country="us"):
-    r = con.execute("SELECT value FROM overrides WHERE keyword=? AND country=? AND field=?",
-                    (keyword.strip().lower(), country, field)).fetchone()
+    r = con.execute(
+        "SELECT value FROM overrides WHERE keyword=%s AND country=%s AND field=%s",
+        (keyword.strip().lower(), country, field)).fetchone()
     return None if r is None else r["value"]
 
 
@@ -127,11 +155,16 @@ def featured_apps(con, keyword: str, country="us") -> list[dict]:
     card sits above every organic result and takes the taps, and when it is
     on-intent it is a direct competitor occupying the most visible slot on the
     page. Dropping it silently made a bought top slot invisible to the model.
+
+    DISTINCT ON, not GROUP BY: the SQLite original selected whole rows while
+    grouping by pkg alone, which Postgres rejects outright and which SQLite only
+    allowed by picking an arbitrary row per group.
     """
     rows = con.execute(
-        "SELECT o.pkg, o.observed_at, a.* FROM observations o JOIN apps a USING (pkg) "
-        "WHERE o.keyword=? AND o.country=? AND o.featured=1 "
-        "GROUP BY o.pkg HAVING MAX(o.observed_at)",
+        "SELECT DISTINCT ON (o.pkg) o.pkg, o.observed_at, a.* "
+        "FROM observations o JOIN apps a USING (pkg) "
+        "WHERE o.keyword=%s AND o.country=%s AND o.featured=1 "
+        "ORDER BY o.pkg, o.observed_at DESC",
         (keyword.strip().lower(), country)).fetchall()
     return [dict(r) for r in rows]
 
@@ -161,15 +194,15 @@ def ranked_field(con, keyword: str, country="us") -> list[dict]:
 
 
 @contextmanager
-def session(path=None):
+def session(url=None):
     """A connection held for exactly as long as it is used.
 
-    The rule this exists to enforce: never hold a connection across network I/O.
-    Scraping a keyword takes ~40s, and keeping the handle open for all of it made
-    every other command wait or fail on "database is locked". Open late, write,
-    close.
+    Postgres readers do not block writers, so this is no longer about lock
+    contention. It is about not leaking connections: the server allows a fixed
+    number, and a handle kept across a 40-second scrape is one nobody else can
+    use.
     """
-    con = connect(path)
+    con = connect(url)
     try:
         yield con
     finally:

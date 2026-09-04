@@ -72,16 +72,16 @@ def apply(con, keyword: str, pkg: str | None = None, rank: int | None = None,
 
         p = predict.score(con, pkg, keyword, country=country)
         target = target_logit_for_rank(p["inc_logits"], int(rank))
-        with con:
+        with con.transaction():
             cur = con.execute(
                 "INSERT INTO corrections (ts, prediction_id, reviewer, kind, value, "
-                "weight, status) VALUES (?,?,?,?,?,?,'queued')",
+                "weight, status) VALUES (%s,%s,%s,%s,%s,%s,'queued')",
                 (db.now(), p["prediction_id"], reviewer, "rank", float(rank), RANK_WEIGHT))
         memory.write(con, cur.lastrowid, keyword,
                      np.array(p["raw"], dtype="float32"), pkg,
                      p["logit"], target, RANK_WEIGHT)
-        queued = con.execute(
-            "SELECT COUNT(*) FROM corrections WHERE status='queued'").fetchone()[0]
+        queued = db.scalar(
+            con, "SELECT COUNT(*) FROM corrections WHERE status='queued'")
         done.append(f"rank {before['predicted_rank']} corrected to {rank} "
                     f"({target - p['logit']:+.2f} logits, {queued}/{MIN_BATCH} queued)")
 

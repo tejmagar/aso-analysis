@@ -29,7 +29,7 @@ def snapshots(con, keyword: str, country: str = "us") -> list[str]:
     """Distinct scrape times for a keyword, oldest first."""
     return [r["observed_at"] for r in con.execute(
         "SELECT DISTINCT observed_at FROM observations "
-        "WHERE keyword=? AND country=? ORDER BY observed_at",
+        "WHERE keyword=%s AND country=%s ORDER BY observed_at",
         (keyword.strip().lower(), country))]
 
 
@@ -37,7 +37,7 @@ def at(con, keyword: str, observed_at: str, country: str = "us") -> dict[str, di
     """The field as it stood at one moment, keyed by package."""
     rows = con.execute(
         "SELECT o.pkg, o.position, o.featured, a.* FROM observations o "
-        "JOIN apps a USING (pkg) WHERE o.keyword=? AND o.country=? "
+        "JOIN apps a USING (pkg) WHERE o.keyword=%s AND o.country=%s "
         "AND o.observed_at=? AND o.position IS NOT NULL",
         (keyword.strip().lower(), country, observed_at)).fetchall()
     return {r["pkg"]: dict(r) for r in rows}
@@ -84,7 +84,7 @@ def transitions(con, keyword: str, country: str = "us",
 
 def all_transitions(con, country: str = "us", min_gap_days: int = 3) -> list[dict]:
     kws = [r["keyword"] for r in con.execute(
-        "SELECT DISTINCT keyword FROM observations WHERE country=?", (country,))]
+        "SELECT DISTINCT keyword FROM observations WHERE country=%s", (country,))]
     out = []
     for kw in kws:
         out += transitions(con, kw, country, min_gap_days)
@@ -110,7 +110,7 @@ def due(con, country: str = "us", every_days: int = 7) -> list[str]:
     """Keywords whose last scrape is older than the tracking interval."""
     rows = con.execute(
         "SELECT keyword, MAX(observed_at) last FROM observations "
-        "WHERE country=? GROUP BY keyword", (country,)).fetchall()
+        "WHERE country=%s GROUP BY keyword", (country,)).fetchall()
     now = db.now()
     return [r["keyword"] for r in rows
             if _days_between(r["last"], now) >= every_days]

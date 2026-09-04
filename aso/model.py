@@ -2,7 +2,7 @@
 
 Small on purpose. Google's ranker already ran, so every SERP is a sorted list and
 we are only learning a one-dimensional projection of it: where does a new app slot
-into an ordering that already exists? That projection is far simpler than the
+into an ordering that already exists%s That projection is far simpler than the
 function behind it, which is why this fits in a few hundred parameters.
 """
 from __future__ import annotations

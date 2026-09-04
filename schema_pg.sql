@@ -1,3 +1,19 @@
+-- Postgres schema for the analyser.
+--
+-- A port of the SQLite one, not a redesign: same tables, same columns, same
+-- names, so a statement that ran against one runs against the other. Three
+-- deliberate differences, each noted where it appears:
+--
+--   INTEGER PRIMARY KEY -> BIGSERIAL   SQLite's rowid alias assigns itself;
+--                                      Postgres needs the sequence spelled out.
+--   INTEGER -> BIGINT                  SQLite integers are 64-bit and Postgres
+--                                      INTEGER is 32-bit; installs pass 2.1e9.
+--   REAL -> DOUBLE PRECISION           Postgres REAL is 32-bit and would round
+--                                      the model's own numbers under it.
+--   timestamps stay TEXT               They are written by db.now() as ISO-8601
+--                                      and compared as strings throughout, and
+--                                      ISO-8601 sorts correctly as text.
+
 -- A rank is a rank: our apps and competitor apps share one table and one label space.
 -- `source` does NOT mean ownership. It records whether we can observe this app's FAILURES.
 --   'serp'   scraped from a result page. Survivor only: absence is unobserved.
@@ -11,9 +27,9 @@ CREATE TABLE IF NOT EXISTS apps (
     description  TEXT DEFAULT '',
     developer    TEXT DEFAULT '',
     category     TEXT DEFAULT '',
-    installs     INTEGER DEFAULT 0,
-    rating       REAL    DEFAULT 0.0,
-    reviews      INTEGER DEFAULT 0,
+    installs     BIGINT DEFAULT 0,
+    rating       DOUBLE PRECISION    DEFAULT 0.0,
+    reviews      BIGINT DEFAULT 0,
     released_at  TEXT,
     updated_at   TEXT,
     country      TEXT DEFAULT 'us',
@@ -26,13 +42,13 @@ CREATE TABLE IF NOT EXISTS apps (
 -- position: 1..250 observed | 251 = checked and absent | NULL = never checked.
 -- The 251 rows are the only true negatives in the whole dataset.
 CREATE TABLE IF NOT EXISTS observations (
-    id          INTEGER PRIMARY KEY,
+    id            BIGSERIAL PRIMARY KEY,
     keyword     TEXT NOT NULL,
     country     TEXT NOT NULL DEFAULT 'us',
     pkg         TEXT NOT NULL REFERENCES apps(pkg),
-    position    INTEGER,
+    position    BIGINT,
     source      TEXT NOT NULL DEFAULT 'serp',
-    featured    INTEGER NOT NULL DEFAULT 0,   -- promoted hero card, not organic
+    featured    BIGINT NOT NULL DEFAULT 0,   -- promoted hero card, not organic
     observed_at TEXT NOT NULL,
     UNIQUE (keyword, country, pkg, observed_at)
 );
@@ -44,10 +60,10 @@ CREATE INDEX IF NOT EXISTS idx_obs_pkg ON observations(pkg);
 CREATE TABLE IF NOT EXISTS fields (
     keyword           TEXT NOT NULL,
     country           TEXT NOT NULL DEFAULT 'us',
-    n                 INTEGER NOT NULL,
-    installs_p10      REAL, installs_p50 REAL, installs_p90 REAL,
-    rating_p50        REAL, reviews_p50   REAL,
-    exact_match_count INTEGER,
+    n                 BIGINT NOT NULL,
+    installs_p10      DOUBLE PRECISION, installs_p50 DOUBLE PRECISION, installs_p90 DOUBLE PRECISION,
+    rating_p50        DOUBLE PRECISION, reviews_p50   DOUBLE PRECISION,
+    exact_match_count BIGINT,
     computed_at       TEXT NOT NULL,
     PRIMARY KEY (keyword, country)
 );
@@ -59,29 +75,29 @@ CREATE TABLE IF NOT EXISTS predictions (
     pkg           TEXT NOT NULL,
     keyword       TEXT NOT NULL,
     country       TEXT NOT NULL DEFAULT 'us',
-    chance        REAL, uncertainty REAL, crowding REAL, fit REAL,
-    logit         REAL,
+    chance        DOUBLE PRECISION, uncertainty DOUBLE PRECISION, crowding DOUBLE PRECISION, fit DOUBLE PRECISION,
+    logit         DOUBLE PRECISION,
     features_json TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS corrections (
-    id            INTEGER PRIMARY KEY,
+    id            BIGSERIAL PRIMARY KEY,
     ts            TEXT NOT NULL,
     prediction_id TEXT NOT NULL REFERENCES predictions(id),
     reviewer      TEXT NOT NULL,
     kind          TEXT NOT NULL,          -- outcome | chance | preference
-    value         REAL,
+    value         DOUBLE PRECISION,
     other_pred_id TEXT,
-    weight        REAL NOT NULL DEFAULT 1.0,
+    weight        DOUBLE PRECISION NOT NULL DEFAULT 1.0,
     status        TEXT NOT NULL DEFAULT 'queued'   -- queued | absorbed | rejected
 );
 
 -- T0 residual memory. Read on every prediction, written the instant a reviewer
 -- disagrees, retired once a scheduled retrain absorbs it into the weights.
 CREATE TABLE IF NOT EXISTS residuals (
-    id            INTEGER PRIMARY KEY,
+    id            BIGSERIAL PRIMARY KEY,
     ts            TEXT NOT NULL,
-    correction_id INTEGER REFERENCES corrections(id),
+    correction_id BIGINT REFERENCES corrections(id),
     keyword       TEXT NOT NULL,
     pkg           TEXT,            -- exact target, so a re-query of the same
                                    -- (keyword, app) matches fully even after the
@@ -89,10 +105,10 @@ CREATE TABLE IF NOT EXISTS residuals (
     features_json TEXT NOT NULL,   -- RAW features, not scaled: retraining moves the
                                    -- scaler, and a key stored in old scaled space
                                    -- would silently drift away from its own point
-    residual      REAL NOT NULL,
-    target_logit  REAL,            -- what the reviewer asked for, so retirement
+    residual      DOUBLE PRECISION NOT NULL,
+    target_logit  DOUBLE PRECISION,            -- what the reviewer asked for, so retirement
                                    -- can be verified instead of assumed
-    weight        REAL NOT NULL DEFAULT 1.0,
+    weight        DOUBLE PRECISION NOT NULL DEFAULT 1.0,
     retired_at    TEXT
 );
 
@@ -100,10 +116,10 @@ CREATE TABLE IF NOT EXISTS registry (
     version    TEXT PRIMARY KEY,
     path       TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    n_rows     INTEGER,
-    golden_auc REAL,
-    golden_ece REAL,
-    active     INTEGER NOT NULL DEFAULT 0
+    n_rows     BIGINT,
+    golden_auc DOUBLE PRECISION,
+    golden_ece DOUBLE PRECISION,
+    active     BIGINT NOT NULL DEFAULT 0
 );
 
 -- Demand proxy from Play autocomplete. Separate from the ranker on purpose:
@@ -111,8 +127,8 @@ CREATE TABLE IF NOT EXISTS registry (
 CREATE TABLE IF NOT EXISTS demand (
     keyword     TEXT NOT NULL,
     country     TEXT NOT NULL DEFAULT 'us',
-    score       REAL NOT NULL,
-    hits        INTEGER,
+    score       DOUBLE PRECISION NOT NULL,
+    hits        BIGINT,
     computed_at TEXT NOT NULL,
     PRIMARY KEY (keyword, country)
 );
@@ -124,7 +140,7 @@ CREATE TABLE IF NOT EXISTS overrides (
     keyword  TEXT NOT NULL,
     country  TEXT NOT NULL DEFAULT 'us',
     field    TEXT NOT NULL,          -- demand | crowding
-    value    REAL NOT NULL,
+    value    DOUBLE PRECISION NOT NULL,
     reviewer TEXT,
     ts       TEXT NOT NULL,
     PRIMARY KEY (keyword, country, field)
@@ -136,7 +152,7 @@ CREATE TABLE IF NOT EXISTS overrides (
 CREATE TABLE IF NOT EXISTS suggestions (
     query      TEXT NOT NULL,
     country    TEXT NOT NULL DEFAULT 'us',
-    position   INTEGER NOT NULL,      -- 0-based, as Play ordered them
+    position   BIGINT NOT NULL,      -- 0-based, as Play ordered them
     suggestion TEXT NOT NULL,
     fetched_at TEXT NOT NULL,
     PRIMARY KEY (query, country, position)
@@ -163,20 +179,20 @@ CREATE TABLE IF NOT EXISTS field_history (
     country      TEXT NOT NULL DEFAULT 'us',
     observed_at  TEXT NOT NULL,
     source       TEXT NOT NULL DEFAULT 'scrape',   -- scrape | research
-    n_apps       INTEGER,
-    installs_p50 REAL,
-    installs_p90 REAL,
-    rating_p50   REAL,
-    exact_match  INTEGER,
-    newcomers    INTEGER,
+    n_apps       BIGINT,
+    installs_p50 DOUBLE PRECISION,
+    installs_p90 DOUBLE PRECISION,
+    rating_p50   DOUBLE PRECISION,
+    exact_match  BIGINT,
+    newcomers    BIGINT,
     -- How old the field was AT THE TIME, not as it reads today. Every app in a
     -- June page is three months older now, so dating them from the present would
     -- report a field that had aged without anything happening in it.
-    age_p50      REAL,
-    velocity_p50 REAL,
+    age_p50      DOUBLE PRECISION,
+    velocity_p50 DOUBLE PRECISION,
     -- What share of that page carried a release date. A median age over two of
     -- thirty apps is not the field's age, so the reader is told the weight.
-    age_known_frac REAL,
+    age_known_frac DOUBLE PRECISION,
     PRIMARY KEY (keyword, country, observed_at)
 );
 

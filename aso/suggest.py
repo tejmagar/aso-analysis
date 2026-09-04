@@ -24,24 +24,24 @@ def fetch(query: str, games: bool = False) -> list[str]:
 def refresh(con, query: str, country: str = "us", games: bool = False) -> list[str]:
     q = " ".join(query.strip().lower().split())
     sugg = fetch(q, games=games)
-    with con:
-        con.execute("DELETE FROM suggestions WHERE query=? AND country=?", (q, country))
+    with con.transaction():
+        con.execute("DELETE FROM suggestions WHERE query=%s AND country=%s", (q, country))
         for i, s in enumerate(sugg):
             con.execute("INSERT INTO suggestions (query, country, position, suggestion, "
-                        "fetched_at) VALUES (?,?,?,?,?)", (q, country, i, s, db.now()))
+                        "fetched_at) VALUES (%s,%s,%s,%s,%s)", (q, country, i, s, db.now()))
     return sugg
 
 
 def get(con, query: str, country: str = "us") -> list[str]:
     return [r["suggestion"] for r in con.execute(
-        "SELECT suggestion FROM suggestions WHERE query=? AND country=? ORDER BY position",
+        "SELECT suggestion FROM suggestions WHERE query=%s AND country=%s ORDER BY position",
         (" ".join(query.strip().lower().split()), country))]
 
 
 def age_hours(con, query: str, country: str = "us") -> float | None:
     """How long since this query's suggestions were fetched. None if never."""
     r = con.execute(
-        "SELECT MAX(fetched_at) AS at FROM suggestions WHERE query=? AND country=?",
+        "SELECT MAX(fetched_at) AS at FROM suggestions WHERE query=%s AND country=%s",
         (" ".join(query.strip().lower().split()), country)).fetchone()
     if not r or not r["at"]:
         return None
