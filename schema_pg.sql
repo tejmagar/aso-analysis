@@ -30,6 +30,9 @@ CREATE TABLE IF NOT EXISTS apps (
     installs     BIGINT DEFAULT 0,
     rating       DOUBLE PRECISION    DEFAULT 0.0,
     reviews      BIGINT DEFAULT 0,
+    -- The store's own icon URL. Available on both the search result and the
+    -- detail payload, so it costs nothing extra to keep.
+    icon         TEXT,
     released_at  TEXT,
     updated_at   TEXT,
     country      TEXT DEFAULT 'us',

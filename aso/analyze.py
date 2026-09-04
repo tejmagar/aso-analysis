@@ -11,13 +11,53 @@ import math
 from . import db, features, predict, train
 from .dataset import TOP_K
 
-class NoResults(Exception):
-    """Play returned nothing for this keyword. Not a crash: usually a typo, a
-    keyword nobody has built for, or a storefront where it does not exist."""
+def _page(ranked, featured, keyword):
+    """One list in page order: promoted cards, then the organic results.
 
-    def __init__(self, keyword):
+    `position` is where the app sits on the page. `organic_position` is the
+    rank among organic results only, which is the number the model predicts and
+    the one stored; a promoted card has none.
+    """
+    from . import features as _f
+    out = []
+    for r in list(featured) + list(ranked):
+        promoted = r in featured
+        out.append({
+            "position": len(out) + 1,
+            "organic_position": None if promoted else r.get("position"),
+            "promoted": promoted,
+            "pkg": r.get("pkg"), "title": r.get("title"),
+            "installs": r.get("installs"), "rating": r.get("rating"),
+            "icon": r.get("icon"),
+            "exact_match": _f.exact_match(r.get("title") or "", keyword),
+        })
+    return out
+
+
+class NoResults(Exception):
+    """Nothing ranks organically for this keyword. Not a crash.
+
+    Two ways to get here and they mean opposite things, so the message says
+    which. Play returning nothing at all is usually a typo or a phrase nobody
+    searches. Play returning only promoted cards means the page exists and has
+    no organic competition on it, which is a finding rather than a failure.
+
+    The message matters because it is what the caller sees: it used to be the
+    bare keyword, so the interface showed "bounce ball escape" beside a warning
+    sign and read as a crash.
+    """
+
+    def __init__(self, keyword, promoted=0):
         self.keyword = keyword
-        super().__init__(keyword)
+        self.promoted = promoted
+        if promoted:
+            msg = (f"Play shows only {promoted} promoted card"
+                   f"{'' if promoted == 1 else 's'} for {keyword!r} and nothing "
+                   f"ranking organically, so there is no field to enter.")
+        else:
+            msg = (f"Play returns nothing for {keyword!r}. Check the spelling, or "
+                   f"try the phrase someone would actually search.")
+        super().__init__(msg)
 
 
 DEMAND_BANDS = ((70, "more demand"), (40, "moderate demand"), (0, "less demand"))
@@ -58,7 +98,9 @@ def analyze(con, keyword, country="us", pkg=None, refresh_demand=True, verbose=T
     else:
         say(f"Reading the stored page, {len(rows)} apps")
     if not rows:
-        raise NoResults(keyword)
+        # Distinguish an empty page from one holding only promoted cards. They
+        # are stored with a NULL position and so never count as a field.
+        raise NoResults(keyword, promoted=len(db.featured_apps(con, keyword, country)))
 
     featured = db.featured_apps(con, keyword, country)
     from . import embed
@@ -154,13 +196,16 @@ def analyze(con, keyword, country="us", pkg=None, refresh_demand=True, verbose=T
         "bar": {"installs": fld["installs_p50"], "rating": fld["rating_p50"],
                 "keyword_in_title": fld["exact_match_count"] >= max(fld["n"] // 2, 1)},
         "intents": intents,
-        "top": [{"position": r["position"], "pkg": r["pkg"], "title": r.get("title"),
-                 "installs": r.get("installs"), "rating": r.get("rating"),
-                 "exact_match": features.exact_match(r.get("title") or "", keyword)}
-                # The whole page, not a preview. A caller wanting five can take
-                # five; one wanting to see what actually ranks cannot invent the
-                # rest.
-                for r in ranked],
+        # The page as someone scrolling it sees it: promoted cards first,
+        # because Play puts them above every organic result, then the organic
+        # apps numbered after them.
+        #
+        # The database keeps organic positions and a NULL for a promoted card,
+        # and that is what the model trains on: a paid slot is not evidence
+        # about what ranks, and renumbering the stored rows would silently move
+        # every training label. So the shift happens here, on the way out, and
+        # `organic_position` is carried alongside so the two are never confused.
+        "top": _page(ranked, featured, keyword),
         "candidate": None,
     }
 
@@ -177,6 +222,15 @@ def analyze(con, keyword, country="us", pkg=None, refresh_demand=True, verbose=T
     # "Would a well-built new app rank here?" asked of the model directly.
     say("Placing a new app on the page")
     out["entry"] = predict.score_entry(con, keyword, country)
+    # The model predicts an organic rank. The page it is quoted against now
+    # counts promoted cards, so the entry has to be counted the same way or the
+    # number beside the ladder disagrees with the ladder.
+    if out["entry"] and featured:
+        e = out["entry"]
+        e["organic_rank"] = e["entry_rank"]
+        e["entry_rank"] = e["entry_rank"] + len(featured)
+        e["field_size"] = (e.get("field_size") or 0) + len(featured)
+        e["promoted_above"] = len(featured)
     # The meaning a new app would be entering, so the narrative and the numbers
     # describe the same set of apps.
     if intents.get("groups"):

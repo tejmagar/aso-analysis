@@ -449,9 +449,9 @@ def cmd_analyze(a):
     try:
         o = analyze(con, a.keyword, country=a.country, pkg=pkg, verbose=not a.json)
     except NoResults as e:
-        print(f'\n  Play returned no apps for {e.keyword!r}.\n'
-              f'  Check the spelling, try a broader phrase, or the term may have\n'
-              f'  no apps built for it at all, which is its own kind of answer.\n')
+        # The exception already says which of the two cases this is, and saying
+        # it twice in two different wordings is how they drift apart.
+        print(f"\n  {e}\n")
         con.close()
         return 1
     from .analyze import recommend

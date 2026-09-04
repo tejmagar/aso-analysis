@@ -259,9 +259,18 @@ def set_config(body: Settings):
 @app.post("/analyze", dependencies=[Depends(auth)],
           summary="can a new app rank for this keyword")
 def analyze(body: Analyze):
+    from .analyze import NoResults
     from .analyze import analyze as run
     from .analyze import recommend
     _state["requests"] += 1
+    try:
+        return _analyze(body, run, recommend)
+    except NoResults as e:
+        # 422: the request was well formed, the keyword simply has no field.
+        raise HTTPException(422, {"error": "no_field", "detail": str(e)}) from None
+
+
+def _analyze(body, run, recommend):
     with _gate.slot(), session() as con:
         o = run(con, body.keyword, country=body.country or config.get("country", "us"),
                 pkg=body.pkg, verbose=False, learn=body.learn)
@@ -305,7 +314,13 @@ def analyze_stream(body: Analyze):
                 o.pop("_your_group", None)
                 events.put(("result", o))
         except Exception as e:                       # noqa: BLE001 - reported, not raised
-            events.put(("error", {"detail": str(e) or e.__class__.__name__}))
+            # NoResults carries a sentence written for a reader. Anything else
+            # is a fault, and its str() is usually a fragment that means nothing
+            # outside a traceback, so it is named rather than quoted.
+            from .analyze import NoResults
+            detail = (str(e) if isinstance(e, NoResults)
+                      else f"The analysis failed ({e.__class__.__name__}).")
+            events.put(("error", {"detail": detail}))
         finally:
             events.put((None, None))
 

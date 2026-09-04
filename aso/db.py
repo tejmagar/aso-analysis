@@ -91,7 +91,7 @@ def init(url: str | None = None) -> str:
 
 def upsert_app(con, app: dict) -> None:
     cols = ("pkg title short_desc description developer category installs rating "
-            "reviews released_at updated_at country lang raw_json scraped_at").split()
+            "reviews icon released_at updated_at country lang raw_json scraped_at").split()
     row = {c: app.get(c) for c in cols}
     row["scraped_at"] = row["scraped_at"] or now()
     row["raw_json"] = row["raw_json"] or json.dumps(app, default=str)

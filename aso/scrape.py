@@ -83,6 +83,7 @@ def to_app_row(d: dict, country="us", lang="en") -> dict:
         "installs": parse_int(installs),
         "rating": parse_float(d.get("score") or d.get("rating")),
         "reviews": parse_int(d.get("ratings_count") or d.get("reviews_count")),
+        "icon": d.get("icon"),
         "released_at": parse_date(d.get("released")),
         "updated_at": parse_date(d.get("updated")),
         "country": country, "lang": lang, "raw_json": None, "scraped_at": None,
