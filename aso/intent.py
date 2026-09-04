@@ -131,13 +131,30 @@ def _label(members: list[dict]) -> str:
     return " / ".join(top) if top else "mixed"
 
 
+def lead(split_result: dict) -> dict | None:
+    """The meaning that holds the top of the page.
+
+    Play decides what a phrase means, and it says so by what it ranks first.
+    Groups arrive sorted by best rank, so this is the group containing rank 1.
+    """
+    groups = split_result.get("groups") or []
+    return groups[0] if groups else None
+
+
 def group_for(split_result: dict, pkg: str | None, vec=None) -> dict | None:
     """Which competition would this app actually be in.
 
-    A ranked app is placed by its own membership; anything not on the page yet
-    (your app, or the hypothetical entrant) is placed by nearest centroid. This
-    is what the model needs: your rivals are the apps answering YOUR question,
-    not everything Play happened to put on the page.
+    A ranked app is placed by its own membership. Anything not on the page yet -
+    your app, or the hypothetical entrant - joins the meaning that holds the top
+    of the page, because that is the one the phrase is understood to be about.
+
+    It used to be placed by nearest centroid to the keyword's own embedding, and
+    that is unreliable exactly where it matters. A short phrase embeds weakly:
+    for "native cam" every app on the page scored under the relevance threshold,
+    so the field looked empty of competitors, three separate lower-is-better
+    features all read zero at once, and an unreadable page came back as the best
+    opportunity on offer. Play had in fact answered clearly, ranking a camera app
+    first; nothing was asking it what it had ranked.
     """
     groups = split_result.get("groups") or []
     if not groups:
@@ -145,6 +162,4 @@ def group_for(split_result: dict, pkg: str | None, vec=None) -> dict | None:
     idx = split_result.get("by_pkg", {}).get(pkg)
     if idx is not None:
         return groups[idx]
-    if vec is None:
-        return max(groups, key=lambda g: g["affinity"])
-    return max(groups, key=lambda g: float(np.dot(vec, g["centroid"])))
+    return groups[0]

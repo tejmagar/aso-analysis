@@ -51,6 +51,7 @@ REGISTRY: list[Feat] = [
     Feat("field_relevance_p50", "dec", "median how-much-about-the-keyword of the field"),
     Feat("field_relevant_count", "dec", "how many ranked apps are genuinely on-intent"),
     Feat("field_installs_relevant", "dec", "install median among ON-INTENT apps: the real bar"),
+    Feat("field_no_intent", "free", "nothing on the page shares the leader's meaning"),
     # The opening. A median says what a typical holder looks like; the WEAKEST
     # app holding a top slot says what you actually have to beat. "phone mirror"
     # has a 125-install app at rank 1, which a median of 394K completely buried.
@@ -238,6 +239,7 @@ def extract(app: dict, keyword: str, field: dict,
         "field_relevance_p50":  float(field.get("relevance_p50") or 0.0),
         "field_relevant_count": float(field.get("relevant_count") or 0),
         "field_installs_relevant": math.log1p(field.get("installs_p50_relevant") or 0),
+        "field_no_intent": float(field.get("no_intent") or 0),
         "intent_rivals":   float(field.get("intent_rivals") or 0),
         "intent_median":   math.log1p(field.get("intent_median") or 0),
         "intent_weakest":  math.log1p(field.get("intent_weakest") or 0),
@@ -305,7 +307,8 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
                 "age_p50": 0, "newcomers": 0, "newcomer_installs": 0,
                 "staleness_p50": 0, "newest_entrant_age": 0, "velocity_p50": 0,
                 "age_spread": 0, "age_known_frac": 0, "relevance_p50": 0,
-                "relevant_count": 0, "installs_p50_relevant": 0, "has_featured": 0,
+                "relevant_count": 0, "installs_p50_relevant": 0,
+                "no_intent": 0, "has_featured": 0,
                 "featured_relevance": 0.0, "featured_installs": 0,
                 "weakest_installs": 0, "weakest_rank": 99, "weakest_title": None,
                 "intent_rivals": 0, "intent_median": 0, "intent_weakest": 0,
@@ -328,13 +331,36 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
     rel = np.array([app_relevance(r, keyword, kw_vec, _vec_for(r, app_vecs))
                     for r in ranked])
     weakest = min(ranked, key=lambda r: (r.get("installs") or 0))
-    on_intent = [r for r, v in zip(ranked, rel) if v >= RELEVANT]
+
+    # Who counts as competition.
+    #
+    # Membership of the meaning being scored against, when there is one. That
+    # meaning is Play's own answer: the group holding the top of the page, or
+    # for an app already ranking, its own group.
+    #
+    # The fallback, and what this used to do everywhere, is to score each app's
+    # similarity to the keyword itself and keep whatever clears a threshold.
+    # That fails on exactly the phrases where the answer matters most. A short
+    # phrase embeds weakly, so on "native cam" every app came in under the line,
+    # the page read as having no competitors at all, and three lower-is-better
+    # features hit zero together and called it wide open. Play had answered
+    # perfectly clearly by ranking a camera app first.
+    if intent_group and intent_group.get("packages"):
+        members = set(intent_group["packages"])
+        on_intent = [r for r in ranked if r.get("pkg") in members]
+    else:
+        on_intent = [r for r, v in zip(ranked, rel) if v >= RELEVANT]
     on_inst = np.array([r.get("installs") or 0 for r in on_intent], dtype="float64")
 
     return {
         "n": len(ranked),
         "relevance_p50": float(np.percentile(rel, 50)) if rel.size else 0.0,
         "relevant_count": len(on_intent),
+        # Three of the features above collapse to zero together when nothing is
+        # on-intent, and each reads lower-is-better on its own, so a page we
+        # could not read scored as the best opportunity available. This says
+        # which kind of zero it is.
+        "no_intent": int(len(on_intent) == 0),
         # The bar that actually matters. Falls back to 0 when nothing on the
         # page is on-intent, which is the strongest opportunity signal there is.
         "installs_p50_relevant": float(np.percentile(on_inst, 50)) if on_inst.size else 0.0,
