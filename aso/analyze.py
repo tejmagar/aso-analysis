@@ -149,7 +149,10 @@ def analyze(con, keyword, country="us", pkg=None, refresh_demand=True, verbose=T
         "top": [{"position": r["position"], "pkg": r["pkg"], "title": r.get("title"),
                  "installs": r.get("installs"), "rating": r.get("rating"),
                  "exact_match": features.exact_match(r.get("title") or "", keyword)}
-                for r in ranked[:5]],
+                # The whole page, not a preview. A caller wanting five can take
+                # five; one wanting to see what actually ranks cannot invent the
+                # rest.
+                for r in ranked],
         "candidate": None,
     }
 

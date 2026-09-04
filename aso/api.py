@@ -20,6 +20,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from pathlib import Path
+
 from . import config, db
 from . import env as _env
 
@@ -141,9 +143,21 @@ class Query(BaseModel):
     limit: int | None = None
 
 
-class Limits(BaseModel):
+class Settings(BaseModel):
+    """Anything a caller may change on a live server.
+
+    Server limits apply immediately and are lost on restart unless persisted.
+    Thresholds are a value judgement about what is worth building, so they are
+    always written: a bar that quietly reverted would be worse than no bar.
+    """
     server_max_concurrent: int | None = Field(None, ge=1, le=HARD_MAX)
     server_timeout: float | None = Field(None, gt=0)
+    min_downloads: float | None = Field(None, ge=0)
+    min_downloads_unit: str | None = Field(None, pattern="^(day|month|year)$")
+    max_rank: int | None = Field(None, ge=0)
+    min_build_score: int | None = Field(None, ge=0, le=100)
+    min_model_confidence: int | None = Field(None, ge=0, le=100)
+    top_k: int | None = Field(None, ge=1, le=250)
     persist: bool = False
 
 
@@ -195,20 +209,34 @@ def get_config():
 
 
 @app.post("/config", dependencies=[Depends(auth)], summary="retune a live server")
-def set_config(body: Limits):
-    changed = {}
+def set_config(body: Settings):
+    changed, persist_now = {}, {}
     if body.server_max_concurrent is not None:
         changed["server_max_concurrent"] = _gate.resize(body.server_max_concurrent)
     if body.server_timeout is not None:
         _limits["timeout"] = body.server_timeout
         changed["server_timeout"] = body.server_timeout
+
+    for key in ("min_downloads", "min_downloads_unit", "max_rank",
+                "min_build_score", "min_model_confidence", "top_k"):
+        v = getattr(body, key)
+        if v is not None:
+            changed[key] = persist_now[key] = v
+
     if not changed:
-        raise HTTPException(400, {"error": "bad request",
-                                  "detail": "send server_max_concurrent "
-                                            "and/or server_timeout"})
+        raise HTTPException(400, {
+            "error": "bad request",
+            "detail": "nothing to change",
+            "accepts": sorted(Settings.model_fields)})
+
+    # Thresholds always persist; server limits only when asked.
+    to_save = dict(persist_now)
     if body.persist:
-        config.save(changed)
-    return {"applied": changed, "persisted": body.persist, "in_flight": _gate.held}
+        to_save.update({k: v for k, v in changed.items() if k.startswith("server_")})
+    if to_save:
+        config.save(to_save)
+    return {"applied": changed, "persisted": sorted(to_save),
+            "in_flight": _gate.held}
 
 
 @app.post("/analyze", dependencies=[Depends(auth)],
@@ -256,15 +284,50 @@ def correct(body: Correct):
 # keeps working on the current weights throughout - a fit takes ~30s and
 # blocking every caller for it would make the tool feel broken.
 _job: dict = {"state": "idle", "started": None, "finished": None,
-              "result": None, "error": None, "epochs": None}
+              "result": None, "error": None, "epochs": None,
+              "phase": None, "step": 0, "steps": 0, "note": ""}
 _job_lock = threading.Lock()
+
+# Progress is mirrored to a file as well as held in memory. The API process can
+# be restarted, and a run started from a chat should still be explicable
+# afterwards rather than vanishing with the process that owned it.
+PROGRESS = Path(os.environ.get("ASO_TRAIN_PROGRESS",
+                               Path(db.DB_PATH).parent / "training.txt"))
+
+
+def _write_progress() -> None:
+    try:
+        PROGRESS.parent.mkdir(parents=True, exist_ok=True)
+        started = _job.get("started") or time.time()
+        lines = [f"state    {_job['state']}",
+                 f"phase    {_job.get('phase') or '-'}",
+                 f"step     {_job.get('step')}/{_job.get('steps')}",
+                 f"note     {_job.get('note') or ''}",
+                 f"elapsed  {time.time() - started:.0f}s",
+                 f"updated  {db.now()}"]
+        if _job.get("result"):
+            r = _job["result"]
+            lines += [f"version  {r.get('version')}",
+                      f"auc      {r.get('golden_auc', 0):.3f}",
+                      f"promoted {r.get('promoted')}"]
+        if _job.get("error"):
+            lines.append(f"error    {_job['error']}")
+        PROGRESS.write_text("\n".join(lines) + "\n")
+    except OSError:
+        pass                       # progress reporting must never fail a run
 
 
 def _run_training(epochs: int) -> None:
     from . import train as tr
+
+    def progress(phase, done, total, note):
+        _job.update(phase=phase, step=done, steps=total, note=note)
+        _write_progress()
+
     try:
         with session() as con:
-            version, meta, gated = tr.train(con, epochs=epochs, verbose=False)
+            version, meta, gated = tr.train(con, epochs=epochs, verbose=False,
+                                            progress=progress)
             active = tr.load_active(con)[2]
         _job.update(state="done", finished=time.time(),
                     result={"version": version, "promoted": not gated,
@@ -274,9 +337,12 @@ def _run_training(epochs: int) -> None:
                             "golden_auc": (meta or {}).get("golden_auc"),
                             "golden_ece": (meta or {}).get("golden_ece")})
         _state["model"] = active
+        _job.update(phase="done", step=_job.get("steps", 0))
     except Exception as e:                                # noqa: BLE001
         _job.update(state="failed", finished=time.time(),
                     error=f"{type(e).__name__}: {e}")
+    finally:
+        _write_progress()
 
 
 @app.post("/train", dependencies=[Depends(auth)],
@@ -289,7 +355,9 @@ def train(epochs: int = 400):
                 "detail": "one run at a time; poll GET /train for progress",
                 "started_seconds_ago": round(time.time() - (_job["started"] or 0), 1)})
         _job.update(state="running", started=time.time(), finished=None,
-                    result=None, error=None, epochs=epochs)
+                    result=None, error=None, epochs=epochs,
+                    phase="starting", step=0, steps=0, note="")
+    _write_progress()
     threading.Thread(target=_run_training, args=(epochs,), daemon=True,
                      name="aso-train").start()
     return {"state": "running", "epochs": epochs,

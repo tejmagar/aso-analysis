@@ -30,14 +30,15 @@ MIN_KEYWORDS = 25
 MIN_AUC = 0.55        # only enforced once the split is measurable
 
 
-def _fit_member(model, xm, xf, y, v, w, epochs=400, lr=0.05, seed=0):
+def _fit_member(model, xm, xf, y, v, w, epochs=400, lr=0.05, seed=0,
+                on_epoch=None):
     """Two heads, one trunk. The rank task is the objective; the downloads task
     is a second signal over the same representation, which regularises it."""
     torch.manual_seed(seed)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     known = ~torch.isnan(v)              # release date missing: no label, no gradient
     vt = torch.nan_to_num(v)
-    for _ in range(epochs):
+    for i in range(epochs):
         opt.zero_grad()
         loss = (F.binary_cross_entropy_with_logits(model(xm, xf), y,
                                                    reduction="none") * w).mean()
@@ -45,10 +46,26 @@ def _fit_member(model, xm, xf, y, v, w, epochs=400, lr=0.05, seed=0):
             loss = loss + 0.3 * F.mse_loss(model.velocity(xm, xf)[known], vt[known])
         loss.backward()
         opt.step()
+        # Report every 50 epochs rather than every one: the callback writes to
+        # disk, and a run should not spend its time telling you about itself.
+        if on_epoch and i % 50 == 0:
+            on_epoch(i, float(loss.detach()))
     return float(loss.detach())
 
 
-def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True):
+def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
+          progress=None):
+    """`progress(phase, done, total, note)` is called as the run advances.
+
+    Training takes ~45 seconds and is started from a chat where "working on it"
+    with no further word is indistinguishable from "hung". The callback is what
+    makes the run observable while it happens rather than only when it lands.
+    """
+    def say(phase, done=0, total=1, note=""):
+        if progress:
+            progress(phase, done, total, note)
+
+    say("reading", 0, 1, "building the feature matrix")
     data = dataset.build(con, country)
     if data is None:
         raise SystemExit("no training rows yet. Scrape a few keywords first.")
@@ -88,17 +105,23 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True):
         elif m["source"] == "owned":
             w[i] = max(w[i], 3.0)            # observed absence, unobtainable otherwise
 
+    say("fitting", 0, k, f"{len(y)} rows across "
+        f"{len(np.unique(data['groups']))} keywords")
     model = Ensemble(XM.shape[1], XF.shape[1], k=k, hidden=hidden)
     rng = np.random.default_rng(seed)
     idx_tr = np.flatnonzero(tr)
     for i, member in enumerate(model.members):
+        say("fitting", i, k, f"member {i + 1} of {k}")
         boot = rng.choice(idx_tr, size=len(idx_tr), replace=True)   # bootstrap resample
         _fit_member(member,
                     torch.from_numpy(XM[boot]), torch.from_numpy(XF[boot]),
                     torch.from_numpy(y[boot]), torch.from_numpy(data["v"][boot]),
                     torch.from_numpy(w[boot].astype("float32")),
-                    epochs=epochs, lr=0.05, seed=seed + i)
+                    epochs=epochs, lr=0.05, seed=seed + i,
+                    on_epoch=lambda e, l, _i=i: say(
+                        "fitting", _i, k, f"member {_i + 1} of {k}, epoch {e}"))
 
+    say("scoring", k, k, "measuring against the held-out keywords")
     model.eval()
     with torch.no_grad():
         p_ho, _ = model(torch.from_numpy(XM[ho]), torch.from_numpy(XF[ho]))

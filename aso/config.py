@@ -28,8 +28,10 @@ DEFAULTS: dict = {
     # One download threshold, stated in whatever period you actually think in.
     # Holding a separate number per period invites them to disagree; this way
     # "50 a day" and "18,000 a year" cannot both be set and mean different things.
-    "min_downloads": 0,
-    "min_downloads_unit": "year",      # day | month | year
+    # A build has to earn something to be worth doing. 100 a day is a starting
+    # point, not a recommendation: change it to whatever your bar actually is.
+    "min_downloads": 100,
+    "min_downloads_unit": "day",       # day | month | year
     "max_rank": 0,             # a landing slot worse than this is not worth it
     "min_build_score": 0,      # 0-100, the model's chance of reaching top_k
     "min_model_confidence": 0, # 0-100, ignore calls the model is unsure of
