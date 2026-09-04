@@ -251,14 +251,60 @@ def correct(body: Correct):
         return {"keyword": body.keyword, "applied": done}
 
 
-@app.post("/train", dependencies=[Depends(auth)])
-def train(epochs: int = 400):
+# Training runs in a background thread and reports through this. It holds the
+# sqlite write lock only for the moment it registers the model, so analysis
+# keeps working on the current weights throughout - a fit takes ~30s and
+# blocking every caller for it would make the tool feel broken.
+_job: dict = {"state": "idle", "started": None, "finished": None,
+              "result": None, "error": None, "epochs": None}
+_job_lock = threading.Lock()
+
+
+def _run_training(epochs: int) -> None:
     from . import train as tr
-    with _write, session() as con:
-        version, meta, gated = tr.train(con, epochs=epochs, verbose=False)
-        _state["model"] = tr.load_active(con)[2]
-        return {"version": version, "promoted": not gated,
-                "active": _state["model"], **(meta or {})}
+    try:
+        with session() as con:
+            version, meta, gated = tr.train(con, epochs=epochs, verbose=False)
+            active = tr.load_active(con)[2]
+        _job.update(state="done", finished=time.time(),
+                    result={"version": version, "promoted": not gated,
+                            "active": active,
+                            "rows": (meta or {}).get("n_rows"),
+                            "keywords": (meta or {}).get("n_keywords"),
+                            "golden_auc": (meta or {}).get("golden_auc"),
+                            "golden_ece": (meta or {}).get("golden_ece")})
+        _state["model"] = active
+    except Exception as e:                                # noqa: BLE001
+        _job.update(state="failed", finished=time.time(),
+                    error=f"{type(e).__name__}: {e}")
+
+
+@app.post("/train", dependencies=[Depends(auth)],
+          summary="start a training run in the background")
+def train(epochs: int = 400):
+    with _job_lock:
+        if _job["state"] == "running":
+            raise HTTPException(409, {
+                "error": "already training",
+                "detail": "one run at a time; poll GET /train for progress",
+                "started_seconds_ago": round(time.time() - (_job["started"] or 0), 1)})
+        _job.update(state="running", started=time.time(), finished=None,
+                    result=None, error=None, epochs=epochs)
+    threading.Thread(target=_run_training, args=(epochs,), daemon=True,
+                     name="aso-train").start()
+    return {"state": "running", "epochs": epochs,
+            "detail": "training started; analysis continues on the current model",
+            "poll": "GET /train"}
+
+
+@app.get("/train", dependencies=[Depends(auth)], summary="training progress")
+def train_status():
+    out = {k: v for k, v in _job.items()}
+    if _job["started"]:
+        end = _job["finished"] or time.time()
+        out["elapsed_seconds"] = round(end - _job["started"], 1)
+    out["serving"] = _state["model"]
+    return out
 
 
 # --- raw Play passthroughs: no model, no scraping into the database -------
