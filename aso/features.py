@@ -88,6 +88,19 @@ REGISTRY: list[Feat] = [
     # market rewards new entrants, or that someone well funded just arrived.
     # The direction is genuinely ambiguous, so it is not asserted.
     Feat("field_newcomer_installs", "free", "best installs achieved by a recent entrant"),
+    # What a NEW app on this page actually earns, which is the question the
+    # downloads head is being asked and was not being told.
+    #
+    # field_velocity_p50 above is the median across the whole page, so one
+    # veteran with a lifetime total in the millions sets it however long ago
+    # those installs arrived. On "energy ring" that put the estimate at 82 a day
+    # for an entrant while the apps at ranks 1, 3 and 4 were taking 21, 53 and 5.
+    # A ten-year-old app's lifetime average is not evidence about demand this
+    # month; a recently launched one's is close to the only evidence there is.
+    Feat("field_newcomer_velocity", "free",
+         "installs per year among apps launched in the last year: what entering earns now"),
+    Feat("field_newcomer_evidence", "free",
+         "how many recent launches that rate is measured over"),
     Feat("field_staleness_p50", "free", "median days since the field last updated"),
     Feat("field_age_spread",    "free", "p90 minus p10 age: a multi-cohort field is a ladder"),
     Feat("field_age_known",     "free", "fraction of the field whose release date we actually have"),
@@ -253,6 +266,10 @@ def extract(app: dict, keyword: str, field: dict,
 
         "field_installs_p10": math.log1p(p10),
         "field_newcomer_installs": math.log1p(field.get("newcomer_installs") or 0),
+        "field_newcomer_velocity": math.log1p(field.get("newcomer_velocity") or 0.0),
+        # Paired with the rate, because a median over one app is a number and not
+        # a measurement, and the model should be able to tell the difference.
+        "field_newcomer_evidence": float(field.get("newcomers") or 0),
         "field_staleness_p50": float(field.get("staleness_p50") or 0.0),
         "field_age_spread":    float(field.get("age_spread") or 0.0),
         "field_age_known":     float(field.get("age_known_frac") or 0.0),
@@ -262,6 +279,19 @@ def extract(app: dict, keyword: str, field: dict,
         "days_since_update":  _days_since(app.get("updated_at")) / 365.0,
         **{k: float((sugg or {}).get(k, v)) for k, v in SUGG_DEFAULTS.items()},
     }
+
+
+def _recent_velocity(ranked, ages) -> float:
+    """Median installs per year among apps launched within the last year.
+
+    Everything an app accumulated is divided by its whole life, so an old app's
+    rate is an average over conditions that no longer hold. Restricting it to
+    recent arrivals asks a narrower and more useful question: what has entering
+    this page actually paid lately.
+    """
+    fresh = [(r.get("installs") or 0) / max(a, 0.25)
+             for r, a in zip(ranked, ages) if 0 < a <= 1.0]
+    return float(np.median(fresh)) if fresh else 0.0
 
 
 def _intent_stats(group: dict | None, n_ranked: int, exclude_pkg: str | None) -> dict:
@@ -305,6 +335,7 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
         return {"n": 0, "installs_p10": 0, "installs_p50": 0, "installs_p90": 0,
                 "rating_p50": 0, "reviews_p50": 0, "exact_match_count": 0,
                 "age_p50": 0, "newcomers": 0, "newcomer_installs": 0,
+                "newcomer_velocity": 0.0,
                 "staleness_p50": 0, "newest_entrant_age": 0, "velocity_p50": 0,
                 "age_spread": 0, "age_known_frac": 0, "relevance_p50": 0,
                 "relevant_count": 0, "installs_p50_relevant": 0,
@@ -382,6 +413,9 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
                       if known.size else 0.0,
         "age_known_frac": float(known.size / max(len(ranked), 1)),
         "velocity_p50": float(np.percentile(vel, 50)) if vel.size else 0.0,
+        # The same rate, over recent arrivals only. Their installs were earned
+        # under today's demand rather than averaged across a decade of it.
+        "newcomer_velocity": _recent_velocity(ranked, ages),
         "newcomers": len(recent),
         "newcomer_installs": max((r.get("installs") or 0) for r in recent) if recent else 0,
         "staleness_p50": float(np.percentile(stale, 50)) if stale.size else 0.0,

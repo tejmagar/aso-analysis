@@ -100,12 +100,22 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
     # appears at all. A scraped page cannot show an app that is not on it, so
     # "we published for this and it is absent" stays the one label scraping
     # cannot produce.
-    NEW_YEARS = 1.5
+    # Recency counts continuously, not as a step. A step at eighteen months
+    # weighted an app published last quarter exactly like one published a year
+    # and a half ago, when the first is far better evidence about what entering
+    # this page pays now: it earned its installs under the demand that exists
+    # today, and the second earned them under whatever held a year ago.
+    #
+    # Halving every year, floored at 1. The newest rows carry about four times
+    # the weight of an established app, a two-year-old entrant about 1.5, and
+    # nothing is discarded, because an old app at rank 3 is still evidence about
+    # what holds rank 3.
+    HALF_LIFE = 1.0
     w = np.ones(len(data["y"]), dtype="float32")
     for i, m in enumerate(data["meta"]):
         age = m.get("age_years") or 0.0
-        if 0 < age <= NEW_YEARS:
-            w[i] = 3.0                       # a real entry experiment
+        if age > 0:
+            w[i] = 1.0 + 3.0 * float(0.5 ** (age / HALF_LIFE))
         if m["source"] == "review":
             w[i] = max(w[i], 5.0)            # a human confirmed this rank
         elif m["source"] == "owned":
