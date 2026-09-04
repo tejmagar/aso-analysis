@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: aso-analysis
+Version: 0.1.0
+Summary: Predicts whether an app can rank for a Google Play keyword
+Requires-Python: >=3.10
+Requires-Dist: numpy>=1.26
+Requires-Dist: torch>=2.4
+Provides-Extra: embed
+Requires-Dist: sentence-transformers>=3.0; extra == "embed"

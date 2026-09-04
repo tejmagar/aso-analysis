@@ -1,0 +1,11 @@
+# CPU only. No GPU anywhere in this project by design.
+torch>=2.4          # install the CPU wheel: --index-url https://download.pytorch.org/whl/cpu
+numpy>=1.26
+
+# Optional. Without it, aso/embed.py falls back to a deterministic trigram hash
+# so the pipeline runs end to end. Install before trusting kw_cosine.
+# sentence-transformers>=3.0
+
+# Scraping comes from your local package. Either pip install -e it, or point
+# ASO_GPAPI_SRC at its src/ directory (the default already looks there).
+# google-play-api-unofficial

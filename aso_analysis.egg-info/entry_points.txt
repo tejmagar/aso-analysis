@@ -1,0 +1,2 @@
+[console_scripts]
+aso = aso.cli:main

@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+
+# The database is scraped state, not source. It is large, it changes on every
+# command, and anyone can rebuild it with `aso ingest` / `aso analyze`.
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# The trained checkpoint IS committed: it is ~50KB and it is what lets a fresh
+# clone predict without scraping 150 keywords first. Working history under
+# data/models/ stays out.
+!models/
+!models/latest.pt

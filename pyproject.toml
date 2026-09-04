@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aso-analysis"
+version = "0.1.0"
+description = "Predicts whether an app can rank for a Google Play keyword"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "torch>=2.4",
+    # Play Store reader. Not on PyPI, so installed straight from the repo.
+    "google-play-api-unofficial @ git+https://github.com/tejmagar/google-play-api-unofficial",
+]
+
+[project.optional-dependencies]
+# Strongly recommended. Without it aso/embed.py falls back to a character-trigram
+# hash, and the intent clustering that separates "use your phone as a mirror"
+# from "cast your screen to a TV" stops working.
+embed = ["sentence-transformers>=3.0"]
+# Only needed to list every app by a publisher; Play's search caps at 50.
+publisher = ["selenium>=4.0"]
+all = ["sentence-transformers>=3.0", "selenium>=4.0"]
+
+[project.scripts]
+aso = "aso.cli:main"
+
+[tool.setuptools]
+packages = ["aso"]
