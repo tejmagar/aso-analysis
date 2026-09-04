@@ -11,6 +11,21 @@ import math
 from . import db, features, predict, train
 from .dataset import TOP_K
 
+def _page_age_days(rows):
+    """How long ago the stored page was observed, in days, or None."""
+    from datetime import datetime, timezone
+    stamps = [r.get("observed_at") for r in rows if r.get("observed_at")]
+    if not stamps:
+        return None
+    try:
+        seen = datetime.fromisoformat(str(max(stamps)).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if seen.tzinfo is None:
+        seen = seen.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - seen).total_seconds() / 86400.0
+
+
 def _page(ranked, featured, keyword):
     """One list in page order: promoted cards, then the organic results.
 
@@ -81,12 +96,27 @@ def fmt_n(n) -> str:
 
 
 def analyze(con, keyword, country="us", pkg=None, refresh_demand=True, verbose=True,
-            learn=True, progress=None):
+            learn=True, progress=None, refresh=False, max_age_days=None):
     """`progress(line)` reports each stage as it completes, for a caller that is
     watching rather than waiting."""
     say = progress or (lambda _line: None)
     keyword = keyword.strip().lower()
     rows = predict.field_rows(con, keyword, country)
+
+    # A stored page is reused however old it is, which is right for a page
+    # scraped this morning and wrong for one scraped in June: rankings move, and
+    # answering from a stale page gives a confident wrong number with nothing to
+    # say it is stale. `refresh` forces a fetch; `max_age_days` sets the point
+    # past which one happens on its own.
+    age = _page_age_days(rows)
+    if rows and (refresh or (max_age_days is not None and age is not None
+                             and age > max_age_days)):
+        from . import scrape
+        say(f"The stored page is {age:.0f} days old, fetching it again")
+        scrape.scrape_keyword(con, keyword, country=country, verbose=verbose,
+                              progress=progress)
+        rows = predict.field_rows(con, keyword, country)
+        age = _page_age_days(rows)
 
     if not rows:
         from . import scrape, ui
@@ -206,6 +236,12 @@ def analyze(con, keyword, country="us", pkg=None, refresh_demand=True, verbose=T
         # every training label. So the shift happens here, on the way out, and
         # `organic_position` is carried alongside so the two are never confused.
         "top": _page(ranked, featured, keyword),
+        # When this page was last seen. Pages do not expire on their own, so a
+        # caller that cares about freshness needs to be told rather than having
+        # to assume.
+        "page": {"observed_at": max((r.get("observed_at") for r in rows
+                                     if r.get("observed_at")), default=None),
+                 "age_days": None if age is None else round(age, 2)},
         "candidate": None,
     }
 

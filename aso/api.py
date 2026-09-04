@@ -129,6 +129,9 @@ class Analyze(BaseModel):
     pkg: str | None = Field(None, description="package name or Play Store URL")
     country: str | None = None
     learn: bool = Field(False, description="train on this keyword before answering")
+    refresh: bool = Field(False, description="fetch the page again even if it is stored")
+    max_age_days: float | None = Field(
+        None, description="re-fetch when the stored page is older than this")
     min_downloads: float | None = None
     min_downloads_unit: str | None = Field(None, pattern="^(day|month|year)$")
     max_rank: int | None = None
@@ -273,7 +276,8 @@ def analyze(body: Analyze):
 def _analyze(body, run, recommend):
     with _gate.slot(), session() as con:
         o = run(con, body.keyword, country=body.country or config.get("country", "us"),
-                pkg=body.pkg, verbose=False, learn=body.learn)
+                pkg=body.pkg, verbose=False, learn=body.learn,
+                refresh=body.refresh, max_age_days=body.max_age_days)
         o["recommendation"] = recommend(o, body.model_dump(
             include={"min_downloads", "min_downloads_unit", "max_rank",
                      "min_build_score", "min_model_confidence"},
@@ -306,6 +310,7 @@ def analyze_stream(body: Analyze):
                 o = run(con, body.keyword,
                         country=body.country or config.get("country", "us"),
                         pkg=body.pkg, verbose=False, learn=body.learn,
+                        refresh=body.refresh, max_age_days=body.max_age_days,
                         progress=lambda line: events.put(("stage", line)))
                 o["recommendation"] = recommend(o, body.model_dump(
                     include={"min_downloads", "min_downloads_unit", "max_rank",
