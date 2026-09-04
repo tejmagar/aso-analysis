@@ -27,11 +27,13 @@ def _page_age_days(rows):
 
 
 def _page(ranked, featured, keyword):
-    """One list in page order: promoted cards, then the organic results.
+    """One list in page order: featured cards, then the organic results.
 
-    `position` is where the app sits on the page. `organic_position` is the
-    rank among organic results only, which is the number the model predicts and
-    the one stored; a promoted card has none.
+    `position` is where the app sits on the page. `organic_position` is the rank
+    among organic results only, which is the number the model predicts and the
+    one stored; a featured card has none, because Play is not ranking it. It is
+    shown because Play is confident that app is what the searcher means, which
+    is a different question from which app ranks best for the phrase.
     """
     from . import features as _f
     out = []
@@ -44,6 +46,10 @@ def _page(ranked, featured, keyword):
             "pkg": r.get("pkg"), "title": r.get("title"),
             "installs": r.get("installs"), "rating": r.get("rating"),
             "icon": r.get("icon"),
+            # So a reader can turn lifetime installs into a rate. The store
+            # publishes a total and a release date and nothing in between, so
+            # dividing them is as close as anyone gets from outside.
+            "released_at": r.get("released_at"),
             "exact_match": _f.exact_match(r.get("title") or "", keyword),
         })
     return out
@@ -54,8 +60,10 @@ class NoResults(Exception):
 
     Two ways to get here and they mean opposite things, so the message says
     which. Play returning nothing at all is usually a typo or a phrase nobody
-    searches. Play returning only promoted cards means the page exists and has
-    no organic competition on it, which is a finding rather than a failure.
+    searches. Play returning only a featured card means the opposite: it is
+    confident enough about what the searcher wants to answer with one app and
+    no list, so the phrase already belongs to something. That is a finding
+    rather than a failure, and a reason to look elsewhere.
 
     The message matters because it is what the caller sees: it used to be the
     bare keyword, so the interface showed "bounce ball escape" beside a warning
@@ -66,9 +74,9 @@ class NoResults(Exception):
         self.keyword = keyword
         self.promoted = promoted
         if promoted:
-            msg = (f"Play shows only {promoted} promoted card"
-                   f"{'' if promoted == 1 else 's'} for {keyword!r} and nothing "
-                   f"ranking organically, so there is no field to enter.")
+            msg = (f"Play answers {keyword!r} with a featured card and no "
+                   f"ranked list, which means it is confident that phrase "
+                   f"belongs to one app. There is no field to enter here.")
         else:
             msg = (f"Play returns nothing for {keyword!r}. Check the spelling, or "
                    f"try the phrase someone would actually search.")
@@ -128,8 +136,8 @@ def analyze(con, keyword, country="us", pkg=None, refresh_demand=True, verbose=T
     else:
         say(f"Reading the stored page, {len(rows)} apps")
     if not rows:
-        # Distinguish an empty page from one holding only promoted cards. They
-        # are stored with a NULL position and so never count as a field.
+        # Distinguish an empty page from one Play answered with a featured card.
+        # Those are stored with a NULL position and so never count as a field.
         raise NoResults(keyword, promoted=len(db.featured_apps(con, keyword, country)))
 
     featured = db.featured_apps(con, keyword, country)
@@ -226,15 +234,16 @@ def analyze(con, keyword, country="us", pkg=None, refresh_demand=True, verbose=T
         "bar": {"installs": fld["installs_p50"], "rating": fld["rating_p50"],
                 "keyword_in_title": fld["exact_match_count"] >= max(fld["n"] // 2, 1)},
         "intents": intents,
-        # The page as someone scrolling it sees it: promoted cards first,
+        # The page as someone scrolling it sees it: featured cards first,
         # because Play puts them above every organic result, then the organic
         # apps numbered after them.
         #
-        # The database keeps organic positions and a NULL for a promoted card,
-        # and that is what the model trains on: a paid slot is not evidence
-        # about what ranks, and renumbering the stored rows would silently move
-        # every training label. So the shift happens here, on the way out, and
-        # `organic_position` is carried alongside so the two are never confused.
+        # The database keeps organic positions and a NULL for a featured card,
+        # and that is what the model trains on: a featured card answers "which
+        # app is this phrase about", not "which app ranks for it", and
+        # renumbering the stored rows would silently move every training label.
+        # So the shift happens here, on the way out, and `organic_position` is
+        # carried alongside so the two are never confused.
         "top": _page(ranked, featured, keyword),
         # When this page was last seen. Pages do not expire on their own, so a
         # caller that cares about freshness needs to be told rather than having

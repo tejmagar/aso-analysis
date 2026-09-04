@@ -154,7 +154,9 @@ def featured_apps(con, keyword: str, country="us") -> list[dict]:
     latest_observations() filters them out. They still matter enormously: the
     card sits above every organic result and takes the taps, and when it is
     on-intent it is a direct competitor occupying the most visible slot on the
-    page. Dropping it silently made a bought top slot invisible to the model.
+    page. Dropping it silently made that signal invisible to the model, and it
+    is a strong one: Play shows a featured card when it is confident the phrase
+    belongs to one app.
 
     DISTINCT ON, not GROUP BY: the SQLite original selected whole rows while
     grouping by pkg alone, which Postgres rejects outright and which SQLite only
