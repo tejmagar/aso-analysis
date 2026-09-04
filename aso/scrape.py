@@ -163,11 +163,18 @@ def _relaxed_fetch(query: str, timeout: int = 20) -> list[dict]:
 
 
 def scrape_keyword(con, keyword: str, country="us", lang="en",
-                   with_details=True, sleep=1.0, verbose=True) -> int:
-    """Fetch one SERP and record it. Returns the number of ranked observations."""
+                   with_details=True, sleep=1.0, verbose=True, progress=None) -> int:
+    """Fetch one SERP and record it. Returns the number of ranked observations.
+
+    `progress(line)` is called as each stage completes. This work takes about a
+    minute and a caller watching a spinner cannot tell it apart from a hang, so
+    the stages say what is actually happening rather than being estimated.
+    """
     g = _api()
     keyword = keyword.strip().lower()
     quiet = not verbose
+    say = progress or (lambda _line: None)
+    say(f"Searching Play for {keyword!r}")
 
     with ui.Task(f"searching Play for {keyword!r}", quiet=quiet) as t:
         results = g.fetch_apps(keyword)
@@ -179,6 +186,7 @@ def scrape_keyword(con, keyword: str, country="us", lang="en",
                 t.done("0 results")
         else:
             t.done(f"{len(results)} results")
+    say(f"Found {len(results)} results")
     if not results:
         return 0
 
@@ -204,6 +212,10 @@ def scrape_keyword(con, keyword: str, country="us", lang="en",
         payload = r
         if with_details:
             task.step(pkg)
+            # Every app would be a line a second for thirty seconds, which is
+            # noise. Every fifth is enough to show it is still moving.
+            if task.n % 5 == 0 or task.n == len(ranked):
+                say(f"Reading listings, {task.n} of {len(ranked)}")
             try:
                 detail = g.fetch_app_details(pkg)
                 if detail:
@@ -243,6 +255,7 @@ def scrape_keyword(con, keyword: str, country="us", lang="en",
     task.done(f"{len(ranked) - failed} of {len(ranked)} enriched"
               + (f", {failed} failed" if failed else ""))
     ui.say(f"stored {n} ranked apps for {keyword!r}", quiet)
+    say(f"Stored {n} ranked apps")
     return n
 
 

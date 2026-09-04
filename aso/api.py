@@ -11,11 +11,14 @@ threads exist.
 """
 from __future__ import annotations
 
+import json
+
 import os
 import threading
 import time
 from contextlib import contextmanager
 
+from fastapi.responses import StreamingResponse
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -78,6 +81,12 @@ class Gate:
 
 _gate = Gate(int(config.get("server_max_concurrent", 4)))
 
+if not API_TOKEN:
+    raise SystemExit(
+        "ASO_API_TOKEN is not set.\n"
+        "  Every endpoint requires it. Generate one and put it in the environment:\n"
+        "    ASO_API_TOKEN=$(openssl rand -hex 24)")
+
 app = FastAPI(title="aso-analysis", version="0.1.0",
               summary="Can a new app rank for this Play Store keyword")
 
@@ -85,9 +94,17 @@ app = FastAPI(title="aso-analysis", version="0.1.0",
 # ---------------------------------------------------------------- auth
 def auth(authorization: str = Header(default=""),
          x_api_key: str = Header(default="")) -> None:
-    """Optional. Unset ASO_API_TOKEN means no auth, which is right for loopback."""
+    """Required, always.
+
+    This used to be skipped when ASO_API_TOKEN was unset, on the reasoning that
+    a loopback bind is unreachable from outside. That reasoning does not survive
+    a container: everything on the same docker network can reach it, and an
+    unset variable is exactly how a token goes missing. Refusing to start
+    without one turns a silent hole into a failure at boot.
+    """
     if not API_TOKEN:
-        return
+        raise HTTPException(503, {"error": "misconfigured",
+                                  "detail": "ASO_API_TOKEN is not set on the server"})
     import hmac
     sent = authorization.removeprefix("Bearer ").strip() or x_api_key.strip()
     if not (sent and hmac.compare_digest(sent, API_TOKEN)):
@@ -254,6 +271,60 @@ def analyze(body: Analyze):
             exclude_none=True))
         o.pop("_your_group", None)
         return o
+
+
+@app.post("/analyze/stream", dependencies=[Depends(auth)],
+          summary="the same analysis, narrating each stage as it happens")
+def analyze_stream(body: Analyze):
+    """Server-sent events: one `stage` per step, then one `result` with the
+    same payload /analyze returns.
+
+    The work is blocking and lives in a thread; the generator drains a queue it
+    fills. That keeps the pipeline free of any knowledge that it is being
+    watched, which is why the same functions serve both endpoints.
+    """
+    import queue
+    import threading
+
+    from .analyze import analyze as run
+    from .analyze import recommend
+
+    events: queue.Queue = queue.Queue()
+
+    def work():
+        try:
+            with _gate.slot(), session() as con:
+                o = run(con, body.keyword,
+                        country=body.country or config.get("country", "us"),
+                        pkg=body.pkg, verbose=False, learn=body.learn,
+                        progress=lambda line: events.put(("stage", line)))
+                o["recommendation"] = recommend(o, body.model_dump(
+                    include={"min_downloads", "min_downloads_unit", "max_rank",
+                             "min_build_score", "min_model_confidence"},
+                    exclude_none=True))
+                o.pop("_your_group", None)
+                events.put(("result", o))
+        except Exception as e:                       # noqa: BLE001 - reported, not raised
+            events.put(("error", {"detail": str(e) or e.__class__.__name__}))
+        finally:
+            events.put((None, None))
+
+    _state["requests"] += 1
+    threading.Thread(target=work, daemon=True).start()
+
+    def stream():
+        while True:
+            kind, payload = events.get()
+            if kind is None:
+                break
+            yield f"event: {kind}\ndata: {json.dumps(payload)}\n\n"
+
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={
+        # Proxies that buffer would hold every line until the end, which is
+        # exactly the wait this endpoint exists to remove.
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    })
 
 
 @app.post("/why", dependencies=[Depends(auth)],

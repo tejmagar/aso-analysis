@@ -41,20 +41,28 @@ def fmt_n(n) -> str:
 
 
 def analyze(con, keyword, country="us", pkg=None, refresh_demand=True, verbose=True,
-            learn=True):
+            learn=True, progress=None):
+    """`progress(line)` reports each stage as it completes, for a caller that is
+    watching rather than waiting."""
+    say = progress or (lambda _line: None)
     keyword = keyword.strip().lower()
     rows = predict.field_rows(con, keyword, country)
 
     if not rows:
         from . import scrape, ui
         ui.say(f"{keyword!r} is new, scraping it now", quiet=not verbose)
-        scrape.scrape_keyword(con, keyword, country=country, verbose=verbose)
+        say(f"{keyword!r} has not been looked at before, fetching its page")
+        scrape.scrape_keyword(con, keyword, country=country, verbose=verbose,
+                              progress=progress)
         rows = predict.field_rows(con, keyword, country)
+    else:
+        say(f"Reading the stored page, {len(rows)} apps")
     if not rows:
         raise NoResults(keyword)
 
     featured = db.featured_apps(con, keyword, country)
     from . import embed
+    say("Reading what each listing is about")
     kv = embed.keyword_vec(keyword)
     vecs = {r["pkg"]: embed.app_vec(r.get("title") or "", r.get("short_desc") or "",
                               r.get("description") or "")
@@ -167,6 +175,7 @@ def analyze(con, keyword, country="us", pkg=None, refresh_demand=True, verbose=T
                    f"{tmeta['n_keywords']} keywords" if tmeta else "not enough data yet")
 
     # "Would a well-built new app rank here?" asked of the model directly.
+    say("Placing a new app on the page")
     out["entry"] = predict.score_entry(con, keyword, country)
     # The meaning a new app would be entering, so the narrative and the numbers
     # describe the same set of apps.

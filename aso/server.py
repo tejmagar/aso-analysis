@@ -443,17 +443,15 @@ def serve(host: str = HOST, port: int = PORT,
     # something so easily resolved, and making the caller re-run with a flag to
     # say "yes, obviously", is not a decision worth asking about. `--strict-port`
     # is there for a supervisor that needs a fixed address.
-    # Refuse to listen on a public interface without a token. Failing here is
-    # noisy; discovering later that anyone could POST /train is not.
-    if (host not in ("127.0.0.1", "localhost", "::1") and not API_TOKEN
-            and not os.environ.get("ASO_ALLOW_INSECURE")):
+    # No token, no server, wherever it binds. The loopback exemption was wrong
+    # in a container: every other service on the same network reaches it, and
+    # an unset variable is exactly how a token goes missing.
+    if not API_TOKEN:
         raise SystemExit(
-            f"refusing to bind {host} without ASO_API_TOKEN.\n"
-            f"  This server scrapes, trains and writes to the database, so a\n"
-            f"  reachable port hands a stranger write access.\n\n"
-            f"  Set it in .env:   ASO_API_TOKEN=$(openssl rand -hex 24)\n"
-            f"  Or, if the port is genuinely private (a container network that\n"
-            f"  nothing outside can reach):   ASO_ALLOW_INSECURE=1")
+            "refusing to start without ASO_API_TOKEN.\n"
+            "  This server scrapes, trains and writes to the database, so a\n"
+            "  reachable port hands a stranger write access.\n\n"
+            "  Set it in .env:   ASO_API_TOKEN=$(openssl rand -hex 24)")
 
     requested = port
     try:
