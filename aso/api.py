@@ -477,9 +477,16 @@ def suggest(body: Query):
     out = play.suggest(body.keyword, games=body.games, no_cache=body.no_cache)
     with session() as con:
         age = sg.age_hours(con, body.keyword)
-    return {"query": body.keyword, "suggestions": out, "count": len(out),
+    kw = " ".join(body.keyword.strip().lower().split())
+    return {"query": kw, "suggestions": out, "count": len(out),
             "cached": not body.no_cache,
-            "age_hours": None if age is None else round(age, 2)}
+            "age_hours": None if age is None else round(age, 2),
+            # The same partition /analyze reports, so a caller wanting the list
+            # on its own does not have to run an analysis to get the split, and
+            # does not have to reimplement it to avoid one.
+            "self_rank": out.index(kw) if kw in out else None,
+            "extends": [x for x in out if x != kw and kw in x],
+            "unrelated": [x for x in out if kw not in x]}
 
 
 @app.post("/expand", dependencies=[Depends(auth)],
