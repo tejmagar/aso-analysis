@@ -319,6 +319,32 @@ silently numbered.
 That is the same normalisation the model consumes, so a feature that looks wrong
 can be traced here.
 
+## Importing history
+
+If you have older records of what a keyword's page looked like, they are the
+before-half of a comparison the model can learn from.
+
+```bash
+python -c "from aso import db, oldpages; print(oldpages.load(db.connect()))"
+```
+
+It reads `~/app-idea` (override with the `workspace` argument): the `research`
+table's `top_apps_sample`, and the session JSON files. Those changed schema over
+39 sessions, so it walks the structure looking for a keyword beside a list of
+apps with installs rather than assuming one layout.
+
+```
+  snapshots written         124
+  distinct keywords          98
+  already have today's page  35   <- complete pairs
+  still to scrape            63
+```
+
+One caveat worth knowing: an older snapshot may hold 3-10 apps where a scrape
+holds the full top 10, so the medians are not strictly comparable. `hist_known`
+marks a thin prior so the model can discount it, and both sides are measured
+identically from your first scrape onward.
+
 ## Watching change over time
 
 ```bash
@@ -422,7 +448,8 @@ POST /analyze    {"keyword":"...", "pkg":"...", "country":"us", "learn":false,
                   "max_rank":5, "min_build_score":0, "min_model_confidence":0}
 POST /why        {"keyword":"...", "pkg":"..."}
 POST /correct    {"keyword":"...", "pkg":"...", "rank":4, "reviewer":"agent"}
-POST /train      {"epochs":400}
+POST /train      {"epochs":400}     starts a run, returns immediately
+GET  /train                          progress and the last result
 POST /config     {"server_max_concurrent":12, "server_timeout":300, "persist":false}
 ```
 
@@ -466,6 +493,32 @@ line rather than a traceback.
 ```bash
 curl -s localhost:8765/analyze -d '{"keyword":"habit tracker"}' | jq .recommendation
 ```
+
+## Training without stopping the world
+
+`POST /train` starts a run in a background thread and returns straight away. A
+fit takes ~45 seconds; holding every caller for it made the tool feel broken.
+
+```bash
+curl -s -X POST localhost:8765/train
+  {"state":"running","epochs":400,
+   "detail":"training started; analysis continues on the current model"}
+
+curl -s localhost:8765/train
+  {"state":"done","elapsed_seconds":47.2,"serving":"v66",
+   "result":{"version":"v66","promoted":true,"rows":4070,"keywords":160,
+             "golden_auc":0.785,"golden_ece":0.083}}
+```
+
+**Analysis keeps answering on the current weights throughout** — measured at 4s
+during a live run. The sqlite write lock is taken only for the moment the new
+model is registered, not for the fit.
+
+A second `POST /train` while one is going returns `409` rather than queueing.
+
+A run that scores worse than what is already serving comes back
+`"promoted": false`. That is the gate working, not a failure: the better model
+was kept.
 
 ## What an agent should read
 
@@ -513,6 +566,30 @@ you want the old behaviour.
   trains on. `/suggest` is the exception: it maintains its own day-long cache.
 - A busy port is not an error. The server moves to the next free one and records
   where it landed, so scripts do not need to coordinate.
+
+---
+
+# Telegram
+
+[ASO_Analysis-agent](https://github.com/tejmagar/ASO_Analysis-agent) is a bot
+over this API. It holds no model and no database — it asks the API and renders
+the answer, so the two restart and scale independently.
+
+```
+/analyze habit tracker                    can a new app rank for it
+/analyze habit tracker | com.your.app     for a specific app
+/field habit tracker                      what currently ranks
+/why habit tracker | com.your.app         what is holding an app back
+/suggest habit                            Play autocomplete
+/train                                    retrain, in the background
+/status                                   model, data and the last run
+```
+
+Access is a shared password, asked once per chat. A bare message with no slash
+is treated as `/analyze`.
+
+Run both with docker compose. The API binds loopback and the bot reaches it over
+the compose network, so there is one public entry point rather than two.
 
 ---
 
