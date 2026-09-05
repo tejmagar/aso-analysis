@@ -109,6 +109,16 @@ REGISTRY: list[Feat] = [
          "installs a day the page is actually gaining, measured between snapshots"),
     Feat("field_measured_evidence", "free",
          "how many apps on the page that rate is measured over"),
+    # The same three rates, over the apps answering the same question rather
+    # than the whole page. These are the ones that say anything about what
+    # entering would earn: a page can rank giants that are not competing with
+    # you, and their installs are not your ceiling.
+    Feat("intent_velocity", "dec", "lifetime rate inside your meaning"),
+    Feat("intent_recent_velocity", "free",
+         "rate of apps launched within the year inside your meaning"),
+    Feat("intent_measured_velocity", "dec",
+         "measured growth inside your meaning, between two dated observations"),
+    Feat("intent_evidence", "free", "how many on-intent apps those rates cover"),
     Feat("field_staleness_p50", "free", "median days since the field last updated"),
     Feat("field_age_spread",    "free", "p90 minus p10 age: a multi-cohort field is a ladder"),
     Feat("field_age_known",     "free", "fraction of the field whose release date we actually have"),
@@ -276,6 +286,10 @@ def extract(app: dict, keyword: str, field: dict,
         "field_newcomer_installs": math.log1p(field.get("newcomer_installs") or 0),
         "field_newcomer_velocity": math.log1p(field.get("newcomer_velocity") or 0.0),
         "field_measured_velocity": math.log1p(field.get("measured_velocity") or 0.0),
+        "intent_velocity": math.log1p(field.get("intent_velocity") or 0.0),
+        "intent_recent_velocity": math.log1p(field.get("intent_recent_velocity") or 0.0),
+        "intent_measured_velocity": math.log1p(field.get("intent_measured_velocity") or 0.0),
+        "intent_evidence": float(field.get("intent_evidence") or 0),
         "field_measured_evidence": float(field.get("measured_count") or 0),
         # Paired with the rate, because a median over one app is a number and not
         # a measurement, and the model should be able to tell the difference.
@@ -291,17 +305,34 @@ def extract(app: dict, keyword: str, field: dict,
     }
 
 
-def _recent_velocity(ranked, ages) -> float:
-    """Median installs per year among apps launched within the last year.
+def _rates(rows) -> dict:
+    """How fast a set of apps is growing, three ways.
 
-    Everything an app accumulated is divided by its whole life, so an old app's
-    rate is an average over conditions that no longer hold. Restricting it to
-    recent arrivals asks a narrower and more useful question: what has entering
-    this page actually paid lately.
+    Used for the whole page and again for the meaning being entered, because
+    those answer different questions and only the second one is about you. A
+    page can be full of giants answering something else: on "down detector" the
+    ranked list is Speedtest, Norton and Fing, none of which tells you what a
+    down-detector app earns.
+
+    `measured` is growth between two dated observations, `recent` is the
+    lifetime rate of apps launched within the year, and `all` is the lifetime
+    rate of everything. They are in decreasing order of how much they say about
+    entering now, which is the order the model should weigh them in.
     """
+    ages = [_days_since(r.get("released_at")) / 365.0 for r in rows]
+    lifetime = [(r.get("installs") or 0) / max(a, 0.25)
+                for r, a in zip(rows, ages) if a > 0]
     fresh = [(r.get("installs") or 0) / max(a, 0.25)
-             for r, a in zip(ranked, ages) if 0 < a <= 1.0]
-    return float(np.median(fresh)) if fresh else 0.0
+             for r, a in zip(rows, ages) if 0 < a <= 1.0]
+    measured = [r["measured_per_day"] * 365.0 for r in rows
+                if r.get("measured_per_day") is not None]
+    return {
+        "all": float(np.median(lifetime)) if lifetime else 0.0,
+        "recent": float(np.median(fresh)) if fresh else 0.0,
+        "recent_n": len(fresh),
+        "measured": float(np.median(measured)) if measured else 0.0,
+        "measured_n": len(measured),
+    }
 
 
 def _intent_stats(group: dict | None, n_ranked: int, exclude_pkg: str | None) -> dict:
@@ -346,7 +377,9 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
                 "rating_p50": 0, "reviews_p50": 0, "exact_match_count": 0,
                 "age_p50": 0, "newcomers": 0, "newcomer_installs": 0,
                 "newcomer_velocity": 0.0, "measured_velocity": 0.0,
-                "measured_count": 0,
+                "measured_count": 0, "intent_velocity": 0.0,
+                "intent_recent_velocity": 0.0, "intent_measured_velocity": 0.0,
+                "intent_evidence": 0,
                 "staleness_p50": 0, "newest_entrant_age": 0, "velocity_p50": 0,
                 "age_spread": 0, "age_known_frac": 0, "relevance_p50": 0,
                 "relevant_count": 0, "installs_p50_relevant": 0,
@@ -369,9 +402,6 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
     # divide by ~0 and report an absurd rate.
     vel = np.array([(r.get("installs") or 0) / max(a, 0.25)
                     for r, a in zip(ranked, ages) if a > 0])
-
-    measured = [r["measured_per_day"] for r in ranked
-                if r.get("measured_per_day") is not None]
 
     rel = np.array([app_relevance(r, keyword, kw_vec, _vec_for(r, app_vecs))
                     for r in ranked])
@@ -396,6 +426,11 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
     else:
         on_intent = [r for r, v in zip(ranked, rel) if v >= RELEVANT]
     on_inst = np.array([r.get("installs") or 0 for r in on_intent], dtype="float64")
+
+    # Growth, for the page and for the meaning. Separate because a page can rank
+    # apps that are not competing with you at all, and their numbers are not
+    # evidence about what you would earn.
+    page, mine = _rates(ranked), _rates(on_intent)
 
     return {
         "n": len(ranked),
@@ -426,14 +461,14 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
         "age_spread": float(np.percentile(known, 90) - np.percentile(known, 10))
                       if known.size else 0.0,
         "age_known_frac": float(known.size / max(len(ranked), 1)),
-        "velocity_p50": float(np.percentile(vel, 50)) if vel.size else 0.0,
+        "velocity_p50": page["all"],
         # The same rate, over recent arrivals only. Their installs were earned
         # under today's demand rather than averaged across a decade of it.
-        "newcomer_velocity": _recent_velocity(ranked, ages),
+        "newcomer_velocity": page["recent"],
         # Only the apps actually measured; the rest are absent rather than zero,
         # so a page with one measured app cannot look like a page standing still.
-        "measured_velocity": float(np.median(measured)) if measured else 0.0,
-        "measured_count": len(measured),
+        "measured_velocity": page["measured"],
+        "measured_count": page["measured_n"],
         "newcomers": len(recent),
         "newcomer_installs": max((r.get("installs") or 0) for r in recent) if recent else 0,
         "staleness_p50": float(np.percentile(stale, 50)) if stale.size else 0.0,
