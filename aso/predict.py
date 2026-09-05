@@ -110,9 +110,20 @@ def score(con, pkg: str, keyword: str, country="us", record=True):
     split = intent.split(rows, vecs, kv)
     ss = _set_scaler(blob)
     feats = [_feat_for(r, keyword, rows, kv, featured, vecs, sg, split) for r in ranked]
-    pages = [_page_for(r, keyword, rows, kv, vecs, split, r["position"]) for r in ranked]
+    # Rank-blind, for the field and the candidate alike.
+    #
+    # The rank head trains on the page with rank_gap withheld, because the app
+    # being asked about has no rank yet at serving time. Handing the field its
+    # own positions did two things at once: it fed the head an input pairing it
+    # never saw in training, and it leaked each app's own rank into its own rank
+    # prediction. The field's logits came out inflated - a real app on 17
+    # installs scoring 33 against a ghost on the same relevance scoring 10 - so
+    # the comparison the entire answer rests on was between two numbers computed
+    # different ways. It shows up worst on small pages, where a handful of
+    # inflated rivals is the whole field.
+    pages = [_page_for(r, keyword, rows, kv, vecs, split) for r in ranked]
     cand_feat = _feat_for(app, keyword, rows, kv, featured, vecs, sg, split)
-    cand_page = _page_for(app, keyword, rows, kv, vecs, split, app.get("position"))
+    cand_page = _page_for(app, keyword, rows, kv, vecs, split)
     all_logits = _logits(model, sm, sf, feats + [cand_feat], ss,
                          [x for x, _ in pages] + [cand_page[0]],
                          [m for _, m in pages] + [cand_page[1]])
@@ -221,7 +232,8 @@ def score_entry(con, keyword: str, country="us"):
     split = intent.split(rows, vecs, kv)
     feats = [_feat_for(r, keyword, rows, kv, featured, vecs, sg, split) for r in ranked]
     ss = _set_scaler(blob)
-    pages = [_page_for(r, keyword, rows, kv, vecs, split, r["position"]) for r in ranked]
+    # Rank-blind for the field, exactly as the ghost is. See score().
+    pages = [_page_for(r, keyword, rows, kv, vecs, split) for r in ranked]
     ghost_feat = _feat_for(ghost, keyword, rows, kv, featured, vecs, sg, split)
     ghost_page = _page_for(ghost, keyword, rows, kv, vecs, split)
     lg = _logits(model, sm, sf, feats + [ghost_feat], ss,
