@@ -109,16 +109,35 @@ def organic_positions(results: list[dict]) -> list[tuple[int | None, dict]]:
     return out
 
 
-def _relaxed_fetch(query: str, timeout: int = 20) -> list[dict]:
-    """Workaround for an upstream bug: fetch_apps drops narrow result sets.
+# A candidate list has to be mostly apps, and big enough that "mostly" means
+# something. Both numbers are deliberately loose: the point is to accept a real
+# result list carrying one entry we cannot read, not to guess at what a list is.
+_MIN_ENTRIES = 3
+_MIN_SHARE = 0.6
 
-    `_find_apps_block` only accepts a block of 10 or more entries, so a query
-    Play answers with fewer than 10 apps comes back completely empty rather than
-    short. "shake flashlight" returns 6 real apps and yields nothing.
+# Below this many results, try the relaxed pass as well. A real Play page for a
+# phrase worth analysing does not hold two apps; that number means something was
+# dropped on the way in.
+_THIN = 5
+
+
+def _relaxed_fetch(query: str, timeout: int = 20) -> list[dict]:
+    """Workaround for two upstream bugs, both of which throw away real results.
+
+    The first is a size floor: `_find_apps_block` only accepts a block of ten or
+    more entries, so a query Play answers with fewer comes back empty rather than
+    short. "shake flashlight" returns six real apps and yields nothing.
+
+    The second is stricter and worse. The walker requires EVERY child of a list
+    to parse as an app, so a single entry it cannot read discards the entire
+    page. "all social media app" returns nineteen apps of which eighteen parse
+    cleanly, and the one that does not costs all nineteen: the tool reported no
+    organic field at all for a phrase whose page opens with Facebook, Instagram
+    and TikTok.
 
     This reuses the package's own DS4_RE and _extract, so nothing about the
-    parsing is duplicated; only the size threshold is relaxed. Delete this the
-    day the upstream `len(node) >= 10` becomes `>= 1`.
+    parsing is duplicated. Only the two thresholds move: any number of entries,
+    and a strong majority rather than all of them.
     """
     try:
         from google_play_api_unofficial.http import fetch
@@ -141,20 +160,31 @@ def _relaxed_fetch(query: str, timeout: int = 20) -> list[dict]:
         return []
 
     best: list = []
+    best_score = 0
+
+    def entries(node) -> int:
+        """How many children of this list read as apps."""
+        return sum(1 for x in node
+                   if isinstance(x, list) and len(x) == 1 and _looks_like_app_entry(x[0]))
 
     def walk(node):
-        nonlocal best
+        nonlocal best, best_score
         if isinstance(node, list):
-            if node and all(isinstance(x, list) and len(x) == 1
-                            and _looks_like_app_entry(x[0]) for x in node):
-                if len(node) > len(best):
-                    best = node
+            if len(node) >= _MIN_ENTRIES:
+                good = entries(node)
+                if good >= _MIN_ENTRIES and good >= _MIN_SHARE * len(node) \
+                        and good > best_score:
+                    best, best_score = node, good
             for x in node:
                 walk(x)
 
     walk(data)
     out, seen = [], set()
     for wrapper in best:
+        # Skip the entries that did not parse rather than dropping the list they
+        # were found in; their neighbours are still the result page.
+        if not (isinstance(wrapper, list) and len(wrapper) == 1):
+            continue
         a = _extract(wrapper[0])
         if a and a["package"] not in seen:
             seen.add(a["package"])
@@ -178,13 +208,25 @@ def scrape_keyword(con, keyword: str, country="us", lang="en",
     say(f"Searching Play for {keyword!r}")
 
     with ui.Task(f"searching Play for {keyword!r}", quiet=quiet) as t:
-        results = g.fetch_apps(keyword)
-        if not results:
-            results = _relaxed_fetch(keyword)            # narrow result set, see above
-            if results:
-                t.done(f"{len(results)} results (narrow set, upstream would drop these)")
+        results = g.fetch_apps(keyword) or []
+
+        # A handful of results is as suspicious as none. On "all social media
+        # app" the reader returned exactly one, the featured card, because the
+        # organic list beneath it carried a single entry it could not parse and
+        # the whole list was discarded. Falling back only on zero missed that
+        # entirely, and the tool reported no field for a page that opens with
+        # Facebook and Instagram.
+        if len(results) < _THIN:
+            relaxed = _relaxed_fetch(keyword)
+            if len(relaxed) > len(results):
+                # Keep whatever the reader found, in front: the featured cards
+                # live there, and the relaxed pass only sees the organic list.
+                have = {r.get("package") for r in results}
+                results = results + [r for r in relaxed if r.get("package") not in have]
+                t.done(f"{len(results)} results "
+                       f"({len(relaxed)} recovered that upstream would drop)")
             else:
-                t.done("0 results")
+                t.done(f"{len(results)} results")
         else:
             t.done(f"{len(results)} results")
     say(f"Found {len(results)} results")
