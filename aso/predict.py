@@ -205,45 +205,44 @@ def hypothetical_app(keyword: str) -> dict:
     }
 
 
-def _downloads_confidence(blob, spread: float, points, at_rank: int):
-    """How much to trust the downloads figure, and why not.
+def _downloads_caveats(rows, keyword: str, points, at_rank: int) -> list[str]:
+    """Why the DOWNLOADS figure may not be worth much on this page.
 
-    The NUMBER comes from one measured thing: how today's disagreement compares
-    with the disagreement this same model showed across the held-out pages of
-    its own training run. A raw spread of 0.89 means nothing on its own; against
-    that distribution it means "wider than nine pages in ten". The yardstick is
-    remeasured every run, so a better model that disagrees less everywhere is
-    not scored against an old scale.
+    Downloads only. The rank answer is not qualified here and keeps its own
+    certainty, because rank is the question this page can answer: it shows who
+    is already there, which is exactly the evidence a position needs. What it
+    cannot show is whether anyone SEARCHES the phrase, and that is what a
+    download figure rests on.
 
-    The REASONS are stated separately and do not touch the number. It is
-    tempting to also multiply the confidence down when the slot sits at the edge
-    of the page - entering at #1 means nothing above you, so every rate being
-    read comes from below, which is extrapolation rather than interpolation. But
-    the size of that penalty would be a figure I picked, and the spread already
-    reflects it: the members are what disagree when the evidence runs out. So
-    the edge is reported as context and left out of the arithmetic until it is
-    measured to add something the spread misses.
+    These are FACTS about the evidence, checked by inspection, not a confidence
+    score. That distinction is deliberate. A percentage is a claim about how
+    often the answer is wrong, and the held-out set cannot support one for the
+    case that matters: every row in it is an app that already exists, with a
+    position and an install count. A brand new app entering at the top of a page
+    where nothing matches the phrase never occurs in training, so any number
+    attached to it would be extrapolated from apps in a different situation. An
+    ensemble-spread confidence was built and dropped for exactly this reason: it
+    correlated +0.02 with actual error.
+
+    A sentence the reader can check against the page in front of them is worth
+    more than a number they cannot.
     """
     why = []
-    q = ((blob.get("meta", {}).get("downloads_model") or {}).get("spread_q"))
-    if not q:
-        return None, why                    # a run that never measured it
-    pct = float(np.searchsorted(np.asarray(q), spread)) / (len(q) + 1)
-    if pct >= 0.75:
-        why.append("the ensemble disagrees more than usual about this page")
-
-    above = sum(1 for _, rank, _ in points if rank < at_rank)
-    if not above:
-        why.append("nothing on the page ranks above this slot, so the rate is "
+    if points and not any(rank < at_rank for _, rank, _ in points):
+        why.append("nothing here ranks above your slot, so this rate is "
                    "extended past the apps we can read rather than taken from "
                    "between them")
-    elif above == len(points):
-        why.append("nothing on the page ranks below this slot")
 
-    # Evidence, the same term the rank confidence uses: a model fitted on a
-    # handful of keywords agrees with itself while knowing almost nothing.
-    evidence = min(blob["meta"].get("n_keywords", 0) / 25.0, 1.0)
-    return max(0.0, min(1.0, 1.0 - pct)) * evidence, why
+    # Play returns something for every query. When none of it carries the
+    # phrase, what came back is a fallback - apps answering a NEIGHBOURING
+    # question - and their download rates describe that question, not this one.
+    ranked = [r for r in rows if r.get("position")]
+    if ranked and not any(features.exact_match(r.get("title") or "", keyword)
+                          for r in ranked):
+        why.append(f"none of the {len(ranked)} apps here carry the phrase in "
+                   "their title, so the page shows what Play falls back to "
+                   "rather than anyone competing for this search")
+    return why
 
 
 def score_entry(con, keyword: str, country="us"):
@@ -339,7 +338,7 @@ def score_entry(con, keyword: str, country="us"):
     # trained on, with the release date as the coordinate rather than an age, so
     # "today" is an ordinary point on the line and not the edge of one.
     answered_by = "head"
-    dl_conf, dl_why = None, []
+    dl_why: list[str] = []
     dl_states = blob.get("downloads")
     if dl_states:
         today = downloads.stamp(db.date.today().isoformat())
@@ -353,8 +352,7 @@ def score_entry(con, keyword: str, country="us"):
             hi = undo(float(dmean[0]) + ds)
             spread = ds
             answered_by = "page"
-            dl_conf, dl_why = _downloads_confidence(blob, float(dspread[0]),
-                                                    pts, entry_rank)
+            dl_why = _downloads_caveats(rows, keyword, pts, entry_rank)
     return {
         "entry_rank": entry_rank,
         "downloads": {
@@ -362,11 +360,10 @@ def score_entry(con, keyword: str, country="us"):
             "per_day": per_year / 365.0,
             "low_per_year": lo, "high_per_year": hi,
             "answered_by": answered_by,
-            # Downloads gets its OWN confidence. The one below it is the rank
-            # ensemble's agreement, and lending that number to a different
-            # model's answer is how a page nobody can read ends up looking
-            # certain.
-            "confidence": dl_conf, "uncertain_because": dl_why,
+            # Why this figure may not be worth much, in terms the reader can
+            # check. Downloads only - the rank answer above is not qualified,
+            # and keeps its own certainty.
+            "uncertain_because": dl_why,
         },
         "confidence": conf, "agreement": agree, "evidence": evidence,
         "field_size": len(ranked),
