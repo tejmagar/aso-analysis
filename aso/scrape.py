@@ -230,6 +230,9 @@ def scrape_keyword(con, keyword: str, country="us", lang="en",
 
     with con.transaction():                                  # one transaction, milliseconds
         for row, pos, is_featured in pending:
+            # A dated point for this app, alongside the row that overwrites its
+            # current state. The overwrite is what loses history; this keeps it.
+            db.add_snapshot(con, {**row, "scraped_at": observed_at})
             db.upsert_app(con, row)
             con.execute(
                 "INSERT INTO observations "

@@ -102,6 +102,25 @@ def upsert_app(con, app: dict) -> None:
         f"ON CONFLICT(pkg) DO UPDATE SET {updates}", row)
 
 
+def add_snapshot(con, app: dict, observed_at: str | None = None,
+                 source: str = "scrape") -> None:
+    """Record what an app looked like at this moment.
+
+    Called on every scrape, so growth becomes measurable rather than inferred.
+    Everywhere else stores a lifetime total and a release date, and dividing one
+    by the other averages across the app's whole life: an app that took a million
+    installs in year one and nothing since reads exactly like one earning
+    steadily now. Two of these a month apart give the real rate.
+    """
+    con.execute(
+        "INSERT INTO app_snapshots (pkg, observed_at, installs, rating, reviews, "
+        "updated_at, source) VALUES (%s,%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (pkg, observed_at) DO NOTHING",
+        (app.get("pkg"), observed_at or app.get("scraped_at") or now(),
+         app.get("installs"), app.get("rating"), app.get("reviews"),
+         app.get("updated_at"), source))
+
+
 def add_observation(con, keyword, pkg, position, country="us",
                     source="serp", observed_at=None) -> None:
     con.execute(
@@ -171,6 +190,44 @@ def featured_apps(con, keyword: str, country="us") -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def measured_growth(con, pkgs: list[str]) -> dict[str, float]:
+    """Installs per day between each app's oldest and newest snapshot.
+
+    Measured over a real window rather than divided out of a lifetime, so an app
+    that earned its million a decade ago and one earning steadily now do not
+    read the same. Apps with a single snapshot are absent rather than zero: not
+    yet measured is not the same as not growing.
+    """
+    if not pkgs:
+        return {}
+    rows = con.execute("""
+        SELECT pkg,
+               MIN(observed_at) AS first_at, MAX(observed_at) AS last_at,
+               MIN(installs)    AS first_n,  MAX(installs)    AS last_n
+          FROM app_snapshots WHERE pkg = ANY(%s)
+         GROUP BY pkg HAVING COUNT(*) > 1""", (list(pkgs),)).fetchall()
+    out: dict[str, float] = {}
+    for r in rows:
+        days = _days_between(r["first_at"], r["last_at"])
+        # Under a week the difference is mostly rounding in Play's own reporting.
+        if days < 7 or r["first_n"] is None or r["last_n"] is None:
+            continue
+        gained = (r["last_n"] or 0) - (r["first_n"] or 0)
+        if gained >= 0:
+            out[r["pkg"]] = gained / days
+    return out
+
+
+def _days_between(a: str, b: str) -> float:
+    from datetime import datetime
+    try:
+        pa = datetime.fromisoformat(str(a).replace("Z", "+00:00")).replace(tzinfo=None)
+        pb = datetime.fromisoformat(str(b).replace("Z", "+00:00")).replace(tzinfo=None)
+    except (ValueError, TypeError):
+        return 0.0
+    return abs((pb - pa).total_seconds()) / 86400.0
+
+
 def ranked_field(con, keyword: str, country="us") -> list[dict]:
     """The field for one keyword, with positions made internally consistent.
 
@@ -189,9 +246,13 @@ def ranked_field(con, keyword: str, country="us") -> list[dict]:
     rows.sort(key=lambda r: (r["position"],
                              0 if r.get("source") == "review" else 1,
                              -(r.get("installs") or 0)))
+    growth = measured_growth(con, [r["pkg"] for r in rows])
     for i, r in enumerate(rows, start=1):
         r["slot"] = i
         r["position"] = i          # what every downstream reader uses
+        # Absent when the app has only ever been seen once, which is different
+        # from measured at zero and has to stay distinguishable downstream.
+        r["measured_per_day"] = growth.get(r["pkg"])
     return rows
 
 

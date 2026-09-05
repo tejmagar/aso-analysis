@@ -208,3 +208,23 @@ CREATE TABLE IF NOT EXISTS holdout (
     chosen_at TEXT NOT NULL,
     PRIMARY KEY (keyword, country)
 );
+
+-- What an app looked like at a moment, so growth can be measured rather than
+-- inferred.
+--
+-- Everything else records a lifetime total and a release date, and dividing one
+-- by the other gives an average across the app's whole life. That is not what a
+-- new app would earn now: an app that took a million installs in its first year
+-- and nothing since reads the same as one earning steadily today. Two rows here
+-- a month apart give the real rate over a known window.
+CREATE TABLE IF NOT EXISTS app_snapshots (
+    pkg         TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    installs    BIGINT,
+    rating      DOUBLE PRECISION,
+    reviews     BIGINT,
+    updated_at  TEXT,
+    source      TEXT NOT NULL DEFAULT 'scrape',   -- scrape | research
+    PRIMARY KEY (pkg, observed_at)
+);
+CREATE INDEX IF NOT EXISTS app_snapshots_pkg_idx ON app_snapshots (pkg, observed_at DESC);

@@ -255,9 +255,8 @@ def test_downloads_and_confidence_are_learned():
 
     # Agreement alone must not read as certainty on a barely-fitted model.
     con = db.connect()
-    r = predict.score_entry(con, "phone mirror") if con.execute(
-        "SELECT COUNT(*) FROM observations WHERE keyword='phone mirror'"
-    ).fetchone()[0] else None
+    r = predict.score_entry(con, "phone mirror") if db.scalar(
+        con, "SELECT COUNT(*) FROM observations WHERE keyword='phone mirror'") else None
     if r:
         check("confidence is discounted by how little data exists",
               r["confidence"] <= r["agreement"] and r["evidence"] <= 1.0,
@@ -416,7 +415,7 @@ def test_suggestions_are_real_not_invented():
             "phone mirroring", "phone mirror to pc"]
     for i, term in enumerate(real):
         con.execute("INSERT INTO suggestions (query, country, position, suggestion, "
-                    "fetched_at) VALUES ('phone mirror','us',?,?,?)", (i, term, db.now()))
+                    "fetched_at) VALUES ('phone mirror','us',%s,%s,%s)", (i, term, db.now()))
     con.commit()
 
     sig = S.signals(con, "phone mirror")
@@ -431,7 +430,7 @@ def test_suggestions_are_real_not_invented():
     con.execute("DELETE FROM suggestions")
     for i, term in enumerate(["screen mirroring", "cast to tv", "miracast"]):
         con.execute("INSERT INTO suggestions (query, country, position, suggestion, "
-                    "fetched_at) VALUES ('phone mirrr','us',?,?,?)", (i, term, db.now()))
+                    "fetched_at) VALUES ('phone mirrr','us',%s,%s,%s)", (i, term, db.now()))
     con.commit()
     sig2 = S.signals(con, "phone mirrr")
     check("a reinterpreted query reports itself as unlisted",
@@ -498,10 +497,10 @@ def test_end_to_end():
 
     kw = con.execute("SELECT keyword FROM observations LIMIT 1").fetchone()["keyword"]
     weak = con.execute(
-        "SELECT pkg FROM observations WHERE keyword=? ORDER BY position DESC LIMIT 1",
+        "SELECT pkg FROM observations WHERE keyword=%s ORDER BY position DESC LIMIT 1",
         (kw,)).fetchone()["pkg"]
     strong = con.execute(
-        "SELECT pkg FROM observations WHERE keyword=? AND position=1", (kw,)).fetchone()["pkg"]
+        "SELECT pkg FROM observations WHERE keyword=%s AND position=1", (kw,)).fetchone()["pkg"]
 
     lo = predict.score(con, weak, kw)
     hi = predict.score(con, strong, kw)
@@ -515,7 +514,7 @@ def test_end_to_end():
           f'{hi["crowding"]} == {lo["crowding"]}')
 
     other_kw = con.execute(
-        "SELECT DISTINCT keyword FROM observations WHERE keyword != ? LIMIT 1",
+        "SELECT DISTINCT keyword FROM observations WHERE keyword != %s LIMIT 1",
         (kw,)).fetchone()["keyword"]
     before_other = predict.score(con, strong, other_kw, record=False)["chance"]
 
@@ -533,15 +532,12 @@ def test_end_to_end():
     corrected_rank = after["predicted_rank"]
     train.train(con, k=5, epochs=200, verbose=False)
     check("a correction becomes a permanent observation",
-          con.execute("SELECT COUNT(*) FROM observations WHERE source='review'")
-             .fetchone()[0] == 1)
-    live = con.execute("SELECT COUNT(*) FROM residuals WHERE retired_at IS NULL"
-                       ).fetchone()[0]
+          db.scalar(con, "SELECT COUNT(*) FROM observations WHERE source='review'") == 1)
+    live = db.scalar(con, "SELECT COUNT(*) FROM residuals WHERE retired_at IS NULL")
     check("a residual the model has not learned is KEPT, never silently dropped",
           live in (0, 1), f"{live} still live")
     check("queued corrections are marked absorbed",
-          con.execute("SELECT COUNT(*) FROM corrections WHERE status='queued'")
-             .fetchone()[0] == 0)
+          db.scalar(con, "SELECT COUNT(*) FROM corrections WHERE status='queued'") == 0)
     survived = predict.score(con, weak, kw, record=False)
     check("the correction survives a retrain either way",
           survived["predicted_rank"] <= corrected_rank + 2,

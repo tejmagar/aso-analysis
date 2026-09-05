@@ -101,6 +101,14 @@ REGISTRY: list[Feat] = [
          "installs per year among apps launched in the last year: what entering earns now"),
     Feat("field_newcomer_evidence", "free",
          "how many recent launches that rate is measured over"),
+    # Growth measured over a real window, not divided out of a lifetime. Every
+    # other install signal here is a total over an age, which averages an app's
+    # whole history: one that took a million in year one and nothing since reads
+    # exactly like one earning steadily today. Two dated snapshots say which.
+    Feat("field_measured_velocity", "dec",
+         "installs a day the page is actually gaining, measured between snapshots"),
+    Feat("field_measured_evidence", "free",
+         "how many apps on the page that rate is measured over"),
     Feat("field_staleness_p50", "free", "median days since the field last updated"),
     Feat("field_age_spread",    "free", "p90 minus p10 age: a multi-cohort field is a ladder"),
     Feat("field_age_known",     "free", "fraction of the field whose release date we actually have"),
@@ -267,6 +275,8 @@ def extract(app: dict, keyword: str, field: dict,
         "field_installs_p10": math.log1p(p10),
         "field_newcomer_installs": math.log1p(field.get("newcomer_installs") or 0),
         "field_newcomer_velocity": math.log1p(field.get("newcomer_velocity") or 0.0),
+        "field_measured_velocity": math.log1p(field.get("measured_velocity") or 0.0),
+        "field_measured_evidence": float(field.get("measured_count") or 0),
         # Paired with the rate, because a median over one app is a number and not
         # a measurement, and the model should be able to tell the difference.
         "field_newcomer_evidence": float(field.get("newcomers") or 0),
@@ -335,7 +345,8 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
         return {"n": 0, "installs_p10": 0, "installs_p50": 0, "installs_p90": 0,
                 "rating_p50": 0, "reviews_p50": 0, "exact_match_count": 0,
                 "age_p50": 0, "newcomers": 0, "newcomer_installs": 0,
-                "newcomer_velocity": 0.0,
+                "newcomer_velocity": 0.0, "measured_velocity": 0.0,
+                "measured_count": 0,
                 "staleness_p50": 0, "newest_entrant_age": 0, "velocity_p50": 0,
                 "age_spread": 0, "age_known_frac": 0, "relevance_p50": 0,
                 "relevant_count": 0, "installs_p50_relevant": 0,
@@ -358,6 +369,9 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
     # divide by ~0 and report an absurd rate.
     vel = np.array([(r.get("installs") or 0) / max(a, 0.25)
                     for r, a in zip(ranked, ages) if a > 0])
+
+    measured = [r["measured_per_day"] for r in ranked
+                if r.get("measured_per_day") is not None]
 
     rel = np.array([app_relevance(r, keyword, kw_vec, _vec_for(r, app_vecs))
                     for r in ranked])
@@ -416,6 +430,10 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
         # The same rate, over recent arrivals only. Their installs were earned
         # under today's demand rather than averaged across a decade of it.
         "newcomer_velocity": _recent_velocity(ranked, ages),
+        # Only the apps actually measured; the rest are absent rather than zero,
+        # so a page with one measured app cannot look like a page standing still.
+        "measured_velocity": float(np.median(measured)) if measured else 0.0,
+        "measured_count": len(measured),
         "newcomers": len(recent),
         "newcomer_installs": max((r.get("installs") or 0) for r in recent) if recent else 0,
         "staleness_p50": float(np.percentile(stale, 50)) if stale.size else 0.0,
