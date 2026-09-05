@@ -229,6 +229,56 @@ def measured_growth(con, pkgs: list[str]) -> dict[str, float]:
     return out
 
 
+_AGE_NORMS: dict[int, float] | None = None
+
+
+def age_rate_norms(con, refresh: bool = False) -> dict[int, float]:
+    """What an app of a given age typically earns per year, across everything.
+
+    The reference for judging whether a rate is explained by age has to come
+    from OUTSIDE the page being judged. Compared against its own page, an app
+    that bought its installs looks ordinary whenever its neighbours bought
+    theirs too: on "falling blocks game" a title earning 2,198 a day at eight
+    months scored zero, because the other eight-month-olds beside it were
+    earning twelve and nineteen thousand. Against the corpus, where the median
+    app under a year old earns eight a day, all three are plainly what they are.
+
+    Cached for the process. It moves as the corpus grows, not between requests.
+    """
+    global _AGE_NORMS
+    if _AGE_NORMS is not None and not refresh:
+        return _AGE_NORMS
+    rows = con.execute("""
+        SELECT width_bucket(
+                 EXTRACT(EPOCH FROM (NOW() - a.released_at::timestamptz)) / 31557600.0,
+                 0, 20, 20) AS bucket,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY
+                 a.installs / GREATEST(
+                   EXTRACT(EPOCH FROM (NOW() - a.released_at::timestamptz)) / 31557600.0,
+                   0.25)) AS rate
+          FROM apps a
+         WHERE a.released_at IS NOT NULL AND a.released_at <> ''
+           AND a.installs IS NOT NULL AND a.installs > 0
+           AND a.released_at::timestamptz < NOW()
+         GROUP BY bucket
+        HAVING COUNT(*) >= 20
+    """).fetchall()
+    _AGE_NORMS = {int(r["bucket"]): float(r["rate"] or 0.0)
+                  for r in rows if r["bucket"] is not None}
+    return _AGE_NORMS
+
+
+def norm_for_age(norms: dict[int, float], age_years: float) -> float:
+    """The corpus rate for this age, or the nearest bucket that has one."""
+    if not norms or age_years <= 0:
+        return 0.0
+    b = min(max(int(age_years) + 1, 1), 20)
+    if b in norms:
+        return norms[b]
+    near = min(norms, key=lambda k: abs(k - b))
+    return norms[near]
+
+
 def keyword_breadth(con, pkgs: list[str]) -> dict[str, int]:
     """How many different phrases each app is reachable through, in what we hold.
 
@@ -278,11 +328,13 @@ def ranked_field(con, keyword: str, country="us") -> list[dict]:
     """
     rows = [dict(r) for r in latest_observations(con, country, keyword)]
     pkgs = [r["pkg"] for r in rows]
-    return _slot(rows, measured_growth(con, pkgs), keyword_breadth(con, pkgs))
+    return _slot(rows, measured_growth(con, pkgs), keyword_breadth(con, pkgs),
+                 age_rate_norms(con))
 
 
 def _slot(rows: list[dict], growth: dict[str, float],
-          breadth: dict[str, int] | None = None) -> list[dict]:
+          breadth: dict[str, int] | None = None,
+          norms: dict[int, float] | None = None) -> list[dict]:
     """Shared body of the two readers above and below: order, then dense slots."""
     rows.sort(key=lambda r: (r["position"],
                              0 if r.get("source") == "review" else 1,
@@ -294,6 +346,12 @@ def _slot(rows: list[dict], growth: dict[str, float],
         # from measured at zero and has to stay distinguishable downstream.
         r["measured_per_day"] = growth.get(r["pkg"])
         r["keyword_breadth"] = (breadth or {}).get(r["pkg"], 0)
+        # What an app this old typically earns, corpus-wide. Attached per row so
+        # the features can judge a rate without a database.
+        if norms:
+            age = _days_between(r.get("released_at"), now()) / 365.0 \
+                if r.get("released_at") else 0.0
+            r["age_norm"] = norm_for_age(norms, age)
     return rows
 
 
@@ -309,7 +367,8 @@ def ranked_fields(con, country="us") -> dict[str, list[dict]]:
         by_kw[r["keyword"]].append(dict(r))
     pkgs = list({r["pkg"] for rows in by_kw.values() for r in rows})
     growth, breadth = measured_growth(con, pkgs), keyword_breadth(con, pkgs)
-    return {kw: _slot(rows, growth, breadth) for kw, rows in by_kw.items()}
+    norms = age_rate_norms(con)
+    return {kw: _slot(rows, growth, breadth, norms) for kw, rows in by_kw.items()}
 
 
 @contextmanager

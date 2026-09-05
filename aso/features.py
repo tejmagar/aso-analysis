@@ -190,6 +190,23 @@ REGISTRY: list[Feat] = [
          "the same, for the ones that launched within the year"),
     Feat("band_evidence", "free", "how many apps that neighbourhood rate covers"),
     Feat("below_rate", "dec", "what the apps ranked beneath you earn"),
+    # What a standing start actually pays here.
+    #
+    # Every other rate on this page is an average over apps that did not all
+    # start from nothing recently. "Recent apps earn" on "falling blocks game"
+    # reads as thousands, because two of the six recent apps are a Tetris
+    # sequel earning twelve thousand a day and a title earning two thousand -
+    # both scoring above 0.9 advantage. The four that started from nothing earn
+    # nought, one, three and three.
+    #
+    # So each app is weighted by (1 - advantage): an app whose rate its age
+    # cannot account for contributes almost nothing, one that earned it at the
+    # pace its age implies contributes fully. No threshold, no app excluded -
+    # a weight, so nothing is thrown away and nothing dominates.
+    Feat("unaided_recent_rate", "dec",
+         "what recent apps here earn once the advantaged ones are discounted"),
+    Feat("unaided_recent_evidence", "free",
+         "how much unadvantaged recent growth that figure rests on"),
     # Whether this page's numbers were earned at the pace their ages imply.
     #
     # A page where apps of the same age earn wildly different amounts is a page
@@ -197,10 +214,10 @@ REGISTRY: list[Feat] = [
     # A page where same-age apps earn alike is one where the figures mean what
     # they appear to mean. Neither is asserted here - the spread is reported and
     # the model decides what a spread that size is worth.
-    Feat("inorganic_p90", "free",
-         "how inorganic the fastest-growing apps on this page look"),
-    Feat("inorganic_p50", "free", "the same at the middle of the page"),
-    Feat("leader_inorganic", "free",
+    Feat("advantage_p90", "free",
+         "how much the fastest apps here outrun what their age explains"),
+    Feat("advantage_p50", "free", "the same at the middle of the page"),
+    Feat("leader_advantage", "free",
          "how much of the leader's rate its own age does not account for"),
     Feat("leader_breadth", "free",
          "how many phrases the app holding the top is reachable through"),
@@ -406,9 +423,11 @@ def extract(app: dict, keyword: str, field: dict,
         "band_recent_rate": math.log1p(field.get("band_recent_rate") or 0.0),
         "band_evidence": float(field.get("band_evidence") or 0),
         "below_rate": math.log1p(field.get("below_rate") or 0.0),
-        "inorganic_p90": float(field.get("inorganic_p90") or 0.0),
-        "inorganic_p50": float(field.get("inorganic_p50") or 0.0),
-        "leader_inorganic": float(field.get("leader_inorganic") or 0.0),
+        "unaided_recent_rate": math.log1p(field.get("unaided_recent_rate") or 0.0),
+        "unaided_recent_evidence": float(field.get("unaided_recent_evidence") or 0.0),
+        "advantage_p90": float(field.get("advantage_p90") or 0.0),
+        "advantage_p50": float(field.get("advantage_p50") or 0.0),
+        "leader_advantage": float(field.get("leader_advantage") or 0.0),
         "leader_breadth": math.log1p(field.get("leader_breadth") or 0),
         "breadth_gap": float(field.get("breadth_gap") or 0.0),
         "newest_rate": math.log1p(field.get("newest_rate") or 0.0),
@@ -428,16 +447,25 @@ def extract(app: dict, keyword: str, field: dict,
     }
 
 
-# How fast the inorganic score approaches 1. Not a threshold: the curve is
+# How fast the advantage score approaches 1. Not a threshold: the curve is
 # smooth, so there is no value at which an app suddenly counts as bought. It
 # only sets the scale - a tenfold lead over its cohort reads around 0.5 and a
 # thousandfold around 0.9 - and what any score is worth stays the model's to
 # learn.
-INORGANIC_SCALE = 3.0
+ADVANTAGE_SCALE = 3.0
 
 
-def _inorganic(row, rows) -> float:
+def _advantage(row, rows) -> float:
     """0 to 1: how much of this app's rate its age does not account for.
+
+    Called an advantage rather than anything about ads, because the score
+    cannot tell the causes apart and there are at least three. A budget buys
+    installs. A brand arrives with an audience - Tetris scores high and nobody
+    is buying that. And an app that launched into an empty category earned its
+    numbers against competition that did not exist yet, which is an advantage a
+    newcomer cannot have either. All three leave the same trace: a rate the
+    app\'s age does not account for. What separates them is not in this data,
+    so the name does not pretend otherwise.
 
     Installs bought with ads cannot be observed, but what they leave behind can.
     Six months old and earning a thousand a day, beside other six-month-olds
@@ -464,19 +492,31 @@ def _inorganic(row, rows) -> float:
     age = _days_since(row.get("released_at")) / 365.0
     if age <= 0:
         return 0.0
-    peers = []
-    for r in rows:
-        if r.get("pkg") == row.get("pkg"):
-            continue
-        a = _days_since(r.get("released_at")) / 365.0
-        if a > 0 and 0.5 * age <= a <= 2.0 * age:
-            peers.append(_rate_of(r))
-    if not peers:
-        return 0.0
-    gap = math.log1p(_rate_of(row)) - math.log1p(float(np.median(peers)))
+
+    # The corpus figure first, when the row carries one.
+    #
+    # Judged against its own page an app that bought installs looks ordinary
+    # whenever its neighbours bought theirs: a title earning 2,198 a day at
+    # eight months scored zero, because the other eight-month-olds beside it
+    # were earning twelve and nineteen thousand. Against the corpus, where the
+    # median app under a year old earns eight a day, all three read as what they
+    # are. The page remains the fallback for rows that arrived without a norm.
+    norm = row.get("age_norm") or 0.0
+    if norm <= 0:
+        peers = []
+        for r in rows:
+            if r.get("pkg") == row.get("pkg"):
+                continue
+            a = _days_since(r.get("released_at")) / 365.0
+            if a > 0 and 0.5 * age <= a <= 2.0 * age:
+                peers.append(_rate_of(r))
+        if not peers:
+            return 0.0
+        norm = float(np.median(peers))
+    gap = math.log1p(_rate_of(row)) - math.log1p(norm)
     if gap <= 0:
         return 0.0
-    return 1.0 - math.exp(-gap / INORGANIC_SCALE)
+    return 1.0 - math.exp(-gap / ADVANTAGE_SCALE)
 
 
 def _cos(a, b) -> float:
@@ -586,8 +626,10 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
                 "leader_match": 0.0, "leader_relevance": 0.0, "leader_lead": 0.0,
                 "first_match_rank": 0, "match_starts_below": 0,
                 "band_rate": 0.0, "band_recent_rate": 0.0, "band_evidence": 0,
-                "below_rate": 0.0, "inorganic_p90": 0.0, "inorganic_p50": 0.0,
-                "leader_inorganic": 0.0, "leader_breadth": 0, "breadth_gap": 0.0,
+                "below_rate": 0.0, "unaided_recent_rate": 0.0,
+                "unaided_recent_evidence": 0.0,
+                "advantage_p90": 0.0, "advantage_p50": 0.0,
+                "leader_advantage": 0.0, "leader_breadth": 0, "breadth_gap": 0.0,
                 "newest_rate": 0.0, "newest_rank": 0,
                 "staleness_p50": 0, "newest_entrant_age": 0, "velocity_p50": 0,
                 "age_spread": 0, "age_known_frac": 0, "relevance_p50": 0,
@@ -761,8 +803,9 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
         "intent_neighbour_age": neighbour_age,
         "intent_recent_neighbour_rate": recent_neighbour,
         "intent_recent_neighbour_gap": recent_gap,
-        **_inorganic_page(ranked),
+        **_advantage_page(ranked),
         **_reach_and_newest(ranked),
+        **_unaided_recent(whole),
         "band_rate": band["all"],
         "band_recent_rate": band["recent"],
         "band_evidence": len(near_rows),
@@ -798,7 +841,42 @@ def _reach_and_newest(ranked) -> dict:
     }
 
 
-def _inorganic_page(ranked) -> dict:
+def _unaided_recent(rows) -> dict:
+    """What a standing start pays here, with bought growth weighted down.
+
+    A weighted mean over apps young enough to still describe the market, where
+    each contributes (1 - advantage): an app whose rate its age cannot account
+    for counts for almost nothing, one that earned it at the pace its age
+    implies counts fully. Nothing is excluded and no line is drawn - a page with
+    only bought growth returns a small number resting on almost no weight, and
+    the evidence figure says so rather than the rate pretending otherwise.
+    """
+    recent = [r for r in rows
+              if 0 < _days_since(r.get("released_at")) / 365.0 <= 1.5]
+    if not recent:
+        return {"unaided_recent_rate": 0.0, "unaided_recent_evidence": 0.0}
+    weights = [1.0 - _advantage(r, rows) for r in recent]
+    total = sum(weights)
+    if total <= 1e-6:
+        return {"unaided_recent_rate": 0.0, "unaided_recent_evidence": 0.0}
+    # A weighted MEDIAN, not a mean. A mean is dominated by an outlier however
+    # small its weight: an app earning twelve thousand a day at nine percent
+    # weight still contributes eleven hundred, and the figure came out at 592 on
+    # a page whose unadvantaged apps earn one to five. The median asks which
+    # rate half the weight sits below, so a discounted app moves it a little and
+    # cannot carry it.
+    pairs = sorted(zip((_rate_of(r) for r in recent), weights))
+    seen, half = 0.0, total / 2.0
+    rate = pairs[-1][0]
+    for value, w in pairs:
+        seen += w
+        if seen >= half:
+            rate = value
+            break
+    return {"unaided_recent_rate": rate, "unaided_recent_evidence": total}
+
+
+def _advantage_page(ranked) -> dict:
     """How much of this page's growth its apps' ages do not account for.
 
     A page where same-age apps earn alike is one whose figures mean what they
@@ -806,12 +884,12 @@ def _inorganic_page(ranked) -> dict:
     somebody is buying installs on, and its rates are not a standing start.
     """
     if not ranked:
-        return {"inorganic_p90": 0.0, "inorganic_p50": 0.0, "leader_inorganic": 0.0}
-    scores = [_inorganic(r, ranked) for r in ranked]
+        return {"advantage_p90": 0.0, "advantage_p50": 0.0, "leader_advantage": 0.0}
+    scores = [_advantage(r, ranked) for r in ranked]
     return {
-        "inorganic_p90": float(np.percentile(scores, 90)),
-        "inorganic_p50": float(np.percentile(scores, 50)),
-        "leader_inorganic": scores[0],
+        "advantage_p90": float(np.percentile(scores, 90)),
+        "advantage_p50": float(np.percentile(scores, 50)),
+        "leader_advantage": scores[0],
     }
 
 
@@ -956,7 +1034,7 @@ PAGE_FEATS = [
     # 0 to 1: how much of this app's rate its age does not account for. High is
     # the shape paid installs leave, and also the shape a hit leaves, which is
     # why it is a measurement and not a verdict.
-    "inorganic",
+    "advantage",
     # How many different phrases this app is reachable through. The app that
     # owns a concept is reachable many ways; one renamed to avoid a trademark
     # is reachable only through the generic phrase.
@@ -1020,7 +1098,7 @@ def page_matrix(rows: list[dict], keyword: str, kw_vec=None,
             1.0 if r.get("pkg") in members else 0.0,
             _cos(_vec_for(r, app_vecs), top_vec),
             (r["position"] - top_rank) / 10.0,
-            _inorganic(r, ranked),
+            _advantage(r, ranked),
             math.log1p(r.get("keyword_breadth") or 0),
             1.0 if kw in (r.get("title") or "").lower() else 0.0,
             min(_days_since(r.get("updated_at")) / 365.0, 10.0),
