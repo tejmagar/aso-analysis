@@ -21,7 +21,7 @@ MIN_GROUP = 1
 MAX_GROUPS = 4
 
 
-SIMILARITY = 0.60      # below this, two apps are answering different questions
+SIMILARITY = 0.50      # below this, two apps are answering different questions
 
 
 def _agglomerate(V: np.ndarray, cutoff: float = SIMILARITY) -> list[list[int]]:
@@ -56,7 +56,7 @@ def split(rows: list[dict], vecs: dict, kw_vec=None) -> dict:
         return _one_group(ranked, kw_vec, vecs)
 
     V = np.array([vecs[r["pkg"]] for r in ranked], dtype="float32")
-    idx_groups = _agglomerate(V)
+    idx_groups = _agglomerate(V, SIMILARITY)
 
     groups = []
     for idxs in idx_groups:
