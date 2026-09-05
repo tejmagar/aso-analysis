@@ -514,7 +514,7 @@ def correct(body: Correct):
 # keeps working on the current weights throughout - a fit takes ~30s and
 # blocking every caller for it would make the tool feel broken.
 _job: dict = {"state": "idle", "started": None, "finished": None,
-              "result": None, "error": None, "epochs": None,
+              "result": None, "error": None, "epochs": None, "dl_epochs": None,
               "phase": None, "step": 0, "steps": 0, "note": ""}
 _job_lock = threading.Lock()
 
@@ -561,7 +561,8 @@ def _write_progress() -> None:
         pass                       # progress reporting must never fail a run
 
 
-def _run_training(epochs: int, warm_from: str | None = None) -> None:
+def _run_training(epochs: int, warm_from: str | None = None,
+                  dl_epochs: int | None = None) -> None:
     from . import train as tr
 
     def progress(phase, done, total, note):
@@ -575,6 +576,7 @@ def _run_training(epochs: int, warm_from: str | None = None) -> None:
     try:
         with session() as con:
             version, meta, gated = tr.train(con, epochs=epochs, verbose=False,
+                                            dl_epochs=dl_epochs,
                                             progress=progress,
                                             warm_from=warm_from)
             active = tr.load_active(con)[2]
@@ -612,7 +614,8 @@ def _run_training(epochs: int, warm_from: str | None = None) -> None:
 
 @app.post("/train", dependencies=[Depends(auth)],
           summary="start a training run in the background")
-def train(epochs: int = 400, warm_from: str | None = None):
+def train(epochs: int = 400, warm_from: str | None = None,
+          dl_epochs: int | None = None):
     with _job_lock:
         if _job["state"] == "running":
             raise HTTPException(409, {
@@ -621,12 +624,14 @@ def train(epochs: int = 400, warm_from: str | None = None):
                 "started_seconds_ago": round(time.time() - (_job["started"] or 0), 1)})
         _job.update(state="running", started=time.time(), finished=None,
                     result=None, error=None, epochs=epochs, cancel=False,
-                    warm_from=warm_from,
+                    warm_from=warm_from, dl_epochs=dl_epochs,
                     phase="starting", step=0, steps=0, note="")
     _write_progress()
-    threading.Thread(target=_run_training, args=(epochs, warm_from), daemon=True,
+    threading.Thread(target=_run_training, args=(epochs, warm_from, dl_epochs),
+                     daemon=True,
                      name="aso-train").start()
     return {"state": "running", "epochs": epochs, "warm_from": warm_from,
+            "dl_epochs": dl_epochs,
             "detail": "training started; analysis continues on the current model",
             "poll": "GET /train"}
 

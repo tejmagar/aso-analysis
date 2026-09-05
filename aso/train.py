@@ -191,8 +191,16 @@ def _fit_member(model, xm, xf, y, v, w, xs=None, xb=None, mask=None, rank=None,
 
 
 def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
-          progress=None, warm_from=None):
+          progress=None, warm_from=None, dl_epochs=None):
     """`progress(phase, done, total, note)` is called as the run advances.
+
+    `dl_epochs` trains the downloads model for a different length than the rank
+    model, defaulting to the same. They are separate models answering different
+    questions and they do not converge together: the rank model peaks around 400
+    and is overfitting by 800, while the downloads model is still improving
+    where the rank model has begun to memorise. Tying them to one number meant
+    every run was a compromise, better at one question than it needed to be and
+    worse at the other.
 
     Training takes ~45 seconds and is started from a chat where "working on it"
     with no further word is indistinguishable from "hung". The callback is what
@@ -390,14 +398,18 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
     dl_has = ~np.isnan(DY)
     dl_tr, dl_ho = tr & dl_has, ho & dl_has
     dl_state, dl = None, {"n": 0, "factor_p50": None, "factor_p90": None,
-                          "mae_log": None, "train_loss": None, "rows": 0}
+                          "mae_log": None, "train_loss": None, "rows": 0,
+                          "epochs": None}
+    dl_ep = int(dl_epochs) if dl_epochs else int(epochs)
     if dl_tr.sum() >= 50:
-        say("downloads", 0, k, f"{int(dl_tr.sum())} rows with a rate")
+        say("downloads", 0, k, f"{int(dl_tr.sum())} rows with a rate, "
+            f"{dl_ep} epochs")
         dl_model, dl_curves = downloads.fit_ensemble(
-            DX[dl_tr], DM[dl_tr], DY[dl_tr], k=k, epochs=epochs, seed=seed,
+            DX[dl_tr], DM[dl_tr], DY[dl_tr], k=k, epochs=dl_ep, seed=seed,
             on_member=lambda i, n, l: say("downloads", i, n, f"loss {l:.4f}"))
         dl_state = dl_model.state()
         dl = {"n": int(dl_ho.sum()), "rows": int(dl_tr.sum()),
+              "epochs": dl_ep,
               "train_loss": float(np.mean([c[-1] for c in dl_curves]))}
         if dl_ho.sum():
             dm, dsp = dl_model(DX[dl_ho], DM[dl_ho])
@@ -460,6 +472,7 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
         "downloads": vel,
         "labelled_rows": int((~np.isnan(data["v"])).sum()),
         "epochs": int(epochs), "seed": int(seed), "members": int(k),
+        "dl_epochs": dl_ep,
         # Which of the two runs this was, and what it continued from. Without
         # it a checkpoint's loss cannot be read: a low one means something
         # different when it inherited a fitted model than when it did not.
