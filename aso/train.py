@@ -356,8 +356,8 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
     return version, meta, gated
 
 
-def bootstrap(con, k=7, hidden=24):
-    """Create the initial model from random weights.
+def bootstrap(con=None, k=7, hidden=24):
+    """An untrained model, in memory only.
 
     An untrained network still predicts. Refusing to answer until a gate is
     satisfied would mean the tool has no model on day one and no way to show it
@@ -369,33 +369,64 @@ def bootstrap(con, k=7, hidden=24):
     model = Ensemble(len(F.MONO), len(F.FREE), k=k, hidden=hidden,
                      n_app=len(F.PAGE_FEATS))
     model.eval()
-    n_feat = len(F.REGISTRY)
     ident = {"mean": [0.0] * len(F.MONO), "std": [1.0] * len(F.MONO)}
     identf = {"mean": [0.0] * len(F.FREE), "std": [1.0] * len(F.FREE)}
     meta = {"features": [f.name for f in F.REGISTRY],
             "page_features": F.PAGE_FEATS, "n_rows": 0, "n_keywords": 0,
             "golden_auc": 0.5, "golden_ece": 0.5, "untrained": True,
             "logit_q": np.linspace(-4, 4, 101).tolist()}
-    version = "v0"
-    path = MODELS / "v0.pt"
     idents = {"mean": [0.0] * len(F.PAGE_FEATS), "std": [1.0] * len(F.PAGE_FEATS)}
-    model.save(path, ident, identf, meta, scaler_set=idents)
-    with con.transaction():
-        # Clear the flag first. Without this the bootstrap adds a second active
-        # row beside a real trained one, and "the active model" becomes whichever
-        # the query happens to return.
-        con.execute("UPDATE registry SET active=0")
-        con.execute("INSERT INTO registry (version, path, created_at, "
-                    "n_rows, golden_auc, golden_ece, active) VALUES (%s,%s,%s,0,0.5,0.5,1) "
-                    "ON CONFLICT (version) DO UPDATE SET path=excluded.path, "
-                    "created_at=excluded.created_at, active=excluded.active",
-                    (version, str(path), db.now()))
+    # Nothing is written: no file, no registry row.
+    #
+    # This is reached from load_active, which every analysis request calls, so
+    # writing here made an ordinary read mutate shared state - inserting a row
+    # and clearing `active` on every real checkpoint. On a shared database that
+    # is a live incident: a machine whose registry was momentarily unreadable
+    # would point production at a path only it could see, and serving fell
+    # through to untrained weights while every answer still looked normal.
+    #
+    # An untrained model is not a checkpoint. It has nothing to serve later, no
+    # score to compare, and no reason to outlive the process, so it stays in
+    # memory and the registry keeps recording only what was actually trained.
     return model, {"cfg": model.cfg, "scaler_mono": ident, "scaler_free": identf,
-                   "meta": meta}, version
+                   "scaler_set": idents, "meta": meta}, "untrained"
+
+
+# The last checkpoint read off disk, kept so repeated reads do not repeat the
+# work. Keyed on the file's path AND its modification time, so a switch loads
+# the new file and a checkpoint rewritten in place is not served stale.
+#
+# One entry: serving reads one model, and holding more would keep weights alive
+# for versions nothing is asking for. A dict rather than a bare pair so the swap
+# is a single assignment, which is what makes this safe without a lock.
+_CACHE: dict = {}
 
 
 def _usable(path):
-    """Load a checkpoint, or None if it is missing or predates the feature set."""
+    """Load a checkpoint, or None if it is missing or predates the feature set.
+
+    A hit returns the SAME model object to every caller. That is deliberate and
+    safe: it is in eval mode and every use is under no_grad, so nothing mutates
+    it. It also removes an inconsistency rather than adding one - a single
+    request loaded the model three times, and those three reads could straddle a
+    switch and answer one question from two different models.
+    """
+    try:
+        stamp = (str(path), os.path.getmtime(path))
+    except OSError:
+        return None                    # missing: nothing to load or cache
+    hit = _CACHE.get("one")
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    got = _load(path)
+    # Failures are not cached. They are cheap to recheck, and a checkpoint that
+    # was unreadable for a moment should not stay unreadable for the process.
+    if got is not None:
+        _CACHE["one"] = (stamp, got)
+    return got
+
+
+def _load(path):
     from . import features as F
     try:
         model, blob = Ensemble.load(Path(path))
