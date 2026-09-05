@@ -207,6 +207,26 @@ REGISTRY: list[Feat] = [
          "what recent apps here earn once the advantaged ones are discounted"),
     Feat("unaided_recent_evidence", "free",
          "how much unadvantaged recent growth that figure rests on"),
+    # The page's own curve: how earnings fall with rank, and rise with age.
+    #
+    # In a category with almost no new apps there is nothing recent to copy the
+    # answer from, but the page still shows the SHAPE - Tetris at the top on
+    # twenty-one thousand a day, a three-month-old at rank three on three. The
+    # two effects are tangled, because the app at the top is usually also the
+    # oldest, so they are separated by fitting both at once: log rate against
+    # rank and against log age, across every app on the page.
+    #
+    # The fit is reported with its quality, never on its own. On a page whose
+    # deeper ranks hold bigger apps the rank slope comes out POSITIVE, which is
+    # true of that page and would be a lie as an answer. A slope with an R of
+    # two tenths and a slope with seven are different claims and arrive as
+    # different numbers.
+    Feat("curve_rank_slope", "free", "how log rate moves per rank on this page"),
+    Feat("curve_age_slope", "free", "how log rate moves per log day of age"),
+    Feat("curve_fit", "free", "how much of the page those two actually explain"),
+    Feat("curve_here", "dec",
+         "what that curve pays at your rank, at the age of the newest app here"),
+    Feat("curve_points", "free", "how many apps the curve was fitted through"),
     # Whether this page's numbers were earned at the pace their ages imply.
     #
     # A page where apps of the same age earn wildly different amounts is a page
@@ -425,6 +445,11 @@ def extract(app: dict, keyword: str, field: dict,
         "below_rate": math.log1p(field.get("below_rate") or 0.0),
         "unaided_recent_rate": math.log1p(field.get("unaided_recent_rate") or 0.0),
         "unaided_recent_evidence": float(field.get("unaided_recent_evidence") or 0.0),
+        "curve_rank_slope": float(field.get("curve_rank_slope") or 0.0),
+        "curve_age_slope": float(field.get("curve_age_slope") or 0.0),
+        "curve_fit": float(field.get("curve_fit") or 0.0),
+        "curve_here": math.log1p(field.get("curve_here") or 0.0),
+        "curve_points": float(field.get("curve_points") or 0),
         "advantage_p90": float(field.get("advantage_p90") or 0.0),
         "advantage_p50": float(field.get("advantage_p50") or 0.0),
         "leader_advantage": float(field.get("leader_advantage") or 0.0),
@@ -453,6 +478,29 @@ def extract(app: dict, keyword: str, field: dict,
 # thousandfold around 0.9 - and what any score is worth stays the model's to
 # learn.
 ADVANTAGE_SCALE = 3.0
+
+
+def _rate_gap(row, rows) -> float:
+    """Signed log gap between this app's rate and what its age normally earns.
+
+    What _advantage measures, before it is squashed into nought-to-one. The
+    squash needs a scale to bound it and that scale was picked, not measured, so
+    the unbounded number travels alongside and the network decides what shape to
+    give it.
+    """
+    age = _days_since(row.get("released_at")) / 365.0
+    if age <= 0:
+        return 0.0
+    norm = row.get("age_norm") or 0.0
+    if norm <= 0:
+        peers = [_rate_of(r) for r in rows
+                 if r.get("pkg") != row.get("pkg")
+                 and 0 < _days_since(r.get("released_at")) / 365.0
+                 and 0.5 * age <= _days_since(r.get("released_at")) / 365.0 <= 2.0 * age]
+        if not peers:
+            return 0.0
+        norm = float(np.median(peers))
+    return math.log1p(_rate_of(row)) - math.log1p(norm)
 
 
 def _advantage(row, rows) -> float:
@@ -641,6 +689,8 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
                 "band_rate": 0.0, "band_recent_rate": 0.0, "band_evidence": 0,
                 "below_rate": 0.0, "unaided_recent_rate": 0.0,
                 "unaided_recent_evidence": 0.0,
+                "curve_rank_slope": 0.0, "curve_age_slope": 0.0, "curve_fit": 0.0,
+                "curve_here": 0.0, "curve_points": 0,
                 "advantage_p90": 0.0, "advantage_p50": 0.0,
                 "leader_advantage": 0.0, "leader_breadth": 0, "breadth_gap": 0.0,
                 "newest_rate": 0.0, "newest_rank": 0,
@@ -819,6 +869,7 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
         **_advantage_page(ranked),
         **_reach_and_newest(ranked),
         **_unaided_recent(whole),
+        **_curve(whole, own_rank),
         "band_rate": band["all"],
         "band_recent_rate": band["recent"],
         "band_evidence": len(near_rows),
@@ -852,6 +903,46 @@ def _reach_and_newest(ranked) -> dict:
         "newest_rate": _rate_of(newest) if newest else 0.0,
         "newest_rank": newest["position"] if newest else 0,
     }
+
+
+def _curve(rows, at_rank) -> dict:
+    """Fit this page's own rate against rank and age, then read it at your slot.
+
+    Where a category has no recent arrivals to copy from, the page still shows
+    the shape: what the top earns, what the middle earns, how old each of them
+    is. Rank and age are fitted together because they are tangled - the app at
+    the top is usually also the oldest, and a fit on rank alone credits rank
+    with what age did.
+
+    Read at the age of the NEWEST app here rather than at some chosen number of
+    months, so the reference comes from the page instead of from a constant.
+    """
+    blank = {"curve_rank_slope": 0.0, "curve_age_slope": 0.0, "curve_fit": 0.0,
+             "curve_here": 0.0, "curve_points": 0}
+    pts = [(r["position"], math.log1p(_days_since(r.get("released_at"))),
+            math.log1p(_rate_of(r)))
+           for r in rows
+           if r.get("position") and _days_since(r.get("released_at")) > 0
+           and (r.get("installs") or 0) > 0]
+    # Three unknowns need more than three points before the fit means anything.
+    if len(pts) < 6:
+        return blank
+    P = np.array(pts, dtype="float64")
+    A = np.column_stack([np.ones(len(P)), P[:, 0], P[:, 1]])
+    try:
+        coef, *_ = np.linalg.lstsq(A, P[:, 2], rcond=None)
+    except np.linalg.LinAlgError:
+        return blank
+    resid = P[:, 2] - A @ coef
+    spread = ((P[:, 2] - P[:, 2].mean()) ** 2).sum()
+    fit = 1.0 - (resid ** 2).sum() / spread if spread > 1e-9 else 0.0
+    youngest = float(P[:, 1].min())
+    here = 0.0
+    if at_rank:
+        here = float(np.expm1(min(coef[0] + coef[1] * at_rank + coef[2] * youngest, 30.0)))
+    return {"curve_rank_slope": float(coef[1]), "curve_age_slope": float(coef[2]),
+            "curve_fit": float(max(min(fit, 1.0), -1.0)),
+            "curve_here": max(here, 0.0), "curve_points": len(P)}
 
 
 def _unaided_recent(rows) -> dict:
@@ -1048,6 +1139,12 @@ PAGE_FEATS = [
     # the shape paid installs leave, and also the shape a hit leaves, which is
     # why it is a measurement and not a verdict.
     "advantage",
+    # The same thing unsquashed: log rate minus what apps this age earn across
+    # the corpus, signed and unbounded. The squashed version above needs a scale
+    # constant to bound it, and that constant was chosen rather than measured -
+    # so the raw number goes in beside it and the network can shape it however
+    # the data says, instead of inheriting a curve somebody guessed.
+    "rate_vs_age",
     # How many different phrases this app is reachable through. The app that
     # owns a concept is reachable many ways; one renamed to avoid a trademark
     # is reachable only through the generic phrase.
@@ -1118,6 +1215,7 @@ def page_matrix(rows: list[dict], keyword: str, kw_vec=None,
             _cos(_vec_for(r, app_vecs), top_vec),
             (r["position"] - top_rank) / 10.0,
             _advantage(r, ranked),
+            _rate_gap(r, ranked),
             math.log1p(r.get("keyword_breadth") or 0),
             1.0 if kw in (r.get("title") or "").lower() else 0.0,
             min(_days_since(r.get("updated_at")) / 365.0, 10.0),
