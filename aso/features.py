@@ -529,11 +529,24 @@ def _cos(a, b) -> float:
     return float(np.dot(a, b) / (na * nb))
 
 
+# A day. The only thing the floor has to stop is division by zero on an app
+# released today; anything larger is not a guard, it is a wrong answer for every
+# app younger than it.
+MIN_AGE_YEARS = 1.0 / 365.0
+
+
 def _rate_of(row) -> float:
-    """One app's installs per year. Floored at a quarter year so an app released
-    last week does not divide by ~0 and report an absurd rate."""
+    """One app's installs per year.
+
+    The floor used to be a quarter of a YEAR, which silently rewrote the rate of
+    every app younger than three months - exactly the apps that say what a
+    standing start pays. A seven-day-old app with forty installs earns 5.7 a
+    day; divided by 0.25 it reported 0.4, and the network was asked to learn
+    what newcomers earn from a number fourteen times too small. A thirty-day-old
+    app read three times too low.
+    """
     age = _days_since(row.get("released_at")) / 365.0
-    return (row.get("installs") or 0) / max(age, 0.25) if age > 0 else 0.0
+    return (row.get("installs") or 0) / max(age, MIN_AGE_YEARS) if age > 0 else 0.0
 
 
 def _rates(rows) -> dict:
@@ -1010,7 +1023,7 @@ PAGE_FEATS = [
     "gap_known",         # 0 when the asking app has no rank yet
     "log_installs",
     "log_rate",          # installs per year over its life
-    "age",               # years since release
+    "age",               # log days since release
     "age_known",
     "log_measured",      # installs per year measured between two snapshots
     "measured_known",    # measured at zero and never measured are different
@@ -1088,7 +1101,13 @@ def page_matrix(rows: list[dict], keyword: str, kw_vec=None,
             1.0 if at_rank else 0.0,
             math.log1p(r.get("installs") or 0),
             math.log1p(_rate_of(r)),
-            min(age, 15.0) if age > 0 else 0.0,
+            # Log days, not years. In years a week-old app is 0.019 and a
+            # three-month-old is 0.25, so after scaling every young app
+            # collapses into one indistinguishable sliver near zero - and those
+            # are the apps that carry the answer. In log days a week is 1.9, a
+            # month 3.4, a year 5.9: the young end gets the resolution and the
+            # old end compresses, which is the right way round.
+            math.log1p(_days_since(r.get("released_at"))) if age > 0 else 0.0,
             1.0 if age > 0 else 0.0,
             math.log1p((measured or 0.0) * 365.0),
             1.0 if measured is not None else 0.0,

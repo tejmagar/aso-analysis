@@ -82,7 +82,11 @@ def build(con, country: str = "us", top_n: int = TOP_K):
             # NaN is masked out of the loss, so old rows still train the RANK
             # head and simply contribute nothing to the downloads head.
             age = features._days_since(r.get("released_at")) / 365.0
-            vel.append(math.log1p((r.get("installs") or 0) / max(age, 0.25))
+            # The same floor the features use. At a quarter year this label told
+            # the head that a one-month-old app earning ten a day earned three,
+            # so the thing it was fitted to predict was wrong for every app in
+            # the range that matters most.
+            vel.append(math.log1p(features._rate_of(r))
                        if 0 < age <= NEW_APP_YEARS else float("nan"))
             groups.append(kw)
             meta.append({"pkg": r["pkg"], "keyword": kw, "position": r["position"],
