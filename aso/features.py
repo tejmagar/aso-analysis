@@ -562,7 +562,14 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
     # field it is being scored against, or its own installs leak into the features
     # and the task becomes artificially easy. At prediction time your app is not in
     # the field either, so LOO is also what makes train and serve agree.
-    pool = (r for r in rows if r.get("position") and r.get("pkg") != exclude_pkg)
+    pool = [r for r in rows if r.get("position") and r.get("pkg") != exclude_pkg]
+    # The WHOLE page, in order, kept alongside the top-N window below. The
+    # neighbourhood features need it: computed over the window, an app at rank
+    # thirty has no neighbours inside the top ten and scores zero on every one
+    # of them, while an app at rank three scores a real value - so the feature
+    # stops meaning "what my neighbours earn" and starts meaning "am I in the
+    # top ten", which is the label.
+    whole = sorted(pool, key=lambda r: r["position"])
     ranked = sorted(pool, key=lambda r: r["position"])[:top_n]
     if not ranked:
         return {"n": 0, "installs_p10": 0, "installs_p50": 0, "installs_p90": 0,
@@ -682,9 +689,11 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
     # compares against - wider and it is the page again, narrower and one
     # unusual neighbour is the whole answer.
     if own_rank:
-        near_rows = [r for r in ranked if abs(r["position"] - own_rank) <= 2
+        near_rows = [r for r in whole if abs(r["position"] - own_rank) <= 2
                      and r.get("position") != own_rank]
-        below_rows = [r for r in ranked if r["position"] > own_rank]
+        # Capped, so a page of forty does not make "below me" mean "the page".
+        below_rows = [r for r in whole
+                      if own_rank < r["position"] <= own_rank + 5]
     else:
         near_rows, below_rows = [], []
     band = _rates(near_rows)
