@@ -690,6 +690,43 @@ def delete_checkpoint(version: str):
     return {"deleted": version, "file_removed": removed}
 
 
+@app.delete("/train/checkpoints", dependencies=[Depends(auth)],
+            summary="delete every checkpoint")
+def delete_all_checkpoints(confirm: bool = False):
+    """Empty the registry, the serving one included.
+
+    Unlike deleting one, this deliberately takes the active checkpoint too,
+    because the case it exists for is a feature-set change that stranded every
+    version at once - and refusing the active one there would leave exactly the
+    unusable row you were trying to clear.
+
+    The consequence is real and immediate: nothing serves until a training run
+    finishes, and until then every answer comes from untrained weights. It is
+    not reversible from here, so it takes an explicit confirm.
+    """
+    import os
+
+    if not confirm:
+        raise HTTPException(400, {
+            "error": "not confirmed",
+            "detail": "pass confirm=true. This deletes every checkpoint "
+                      "including the one serving, and nothing answers "
+                      "meaningfully until a training run finishes."})
+    with session() as con:
+        rows = [dict(r) for r in con.execute("SELECT version, path FROM registry")]
+        files = 0
+        for r in rows:
+            try:
+                os.remove(r["path"])
+                files += 1
+            except OSError:
+                pass              # already gone, or written on another host
+        con.execute("DELETE FROM registry")
+    _state["model"] = None
+    return {"deleted": len(rows), "files_removed": files,
+            "detail": "registry is empty; train to get a model"}
+
+
 @app.get("/train", dependencies=[Depends(auth)], summary="training progress")
 def train_status():
     out = {k: v for k, v in _job.items()}
