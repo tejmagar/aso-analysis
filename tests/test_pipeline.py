@@ -256,10 +256,24 @@ def test_intent_group_is_the_competition():
     check("a meaning already at rank 1 is reported as reachable",
           features.extract({"title": "x", "installs": 0, "rating": 0, "reviews": 0},
                            "phone mirror", grp)["intent_reach"] == 1.0)
+    # Exhaustive on purpose: a new intent_* feature has to state its direction
+    # here, which is the one place the whole set can be read at once. The rates
+    # are "dec" because a field already earning more is harder to enter; the
+    # counts, slopes and rank-relative ones assert nothing, because a bigger
+    # market and a harder page are the same observation.
     check("intent rivals and bar push difficulty down, reach pushes it up",
           {f.name: f.direction for f in features.REGISTRY if f.name.startswith("intent_")}
           == {"intent_rivals": "dec", "intent_median": "dec", "intent_weakest": "dec",
-              "intent_reach": "inc", "intent_share": "free"})
+              "intent_reach": "inc", "intent_share": "free",
+              "intent_velocity": "dec", "intent_recent_velocity": "free",
+              "intent_measured_velocity": "dec", "intent_evidence": "free",
+              "intent_cut": "free", "intent_cut_share": "free",
+              "intent_relevance_drop": "free", "intent_recent_best_rank": "free",
+              "intent_recent_rate_at_best": "free", "intent_neighbour_rate": "free",
+              "intent_neighbour_age": "free", "intent_recent_neighbour_rate": "free",
+              "intent_recent_neighbour_gap": "free"},
+          ", ".join(sorted(f.name for f in features.REGISTRY
+                           if f.name.startswith("intent_"))))
 
 
 def test_downloads_and_confidence_are_learned():
@@ -599,9 +613,32 @@ def test_end_to_end():
     con.close()
 
 
+def _empty_the_test_db() -> None:
+    """Start from nothing.
+
+    These tests assert exact counts - one review observation, zero queued
+    corrections - so anything a previous run left behind fails them. That is not
+    hypothetical: a run that crashed part-way through training left a review
+    observation and a stuck `queued` row committed, and the NEXT run then failed
+    two assertions that had nothing wrong with them, which is worse than the
+    original crash because it points at innocent code.
+
+    Safe only because _refuse_production() has already established that this is
+    a scratch database; it is called immediately after.
+    """
+    from aso import db
+    con = db.connect()
+    tables = [r["tablename"] for r in con.execute(
+        "SELECT tablename FROM pg_tables WHERE schemaname='public'")]
+    if tables:
+        con.execute("TRUNCATE " + ", ".join(tables) + " RESTART IDENTITY CASCADE")
+    con.close()
+
+
 def main():
     print(f"\ntest db: {_TMP}\n")
     _refuse_production()
+    _empty_the_test_db()
     for fn in [test_no_undefined_names, test_promoted_cards_excluded, test_parsers,
                test_field_is_leave_one_out, test_newcomers_signal_penetrability,
                test_intent_and_featured_card, test_intent_group_is_the_competition, test_no_hand_tuned_scoring_remains,
