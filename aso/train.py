@@ -36,6 +36,34 @@ MIN_KEYWORDS = 25
 MIN_AUC = 0.55        # only enforced once the split is measurable
 
 
+def _pairs_within(groups, positions, rng, per_keyword=60):
+    """Index pairs (better, worse) drawn from within one keyword's page.
+
+    Only within: an app at rank 2 for one phrase is not above an app at rank 5
+    for a different one, and pairing across pages would teach an ordering that
+    does not exist. Sampled rather than exhaustive, because a page of twelve has
+    sixty-six pairs and the point is a gradient at the top of each page, not
+    every comparison on it.
+    """
+    hi, lo = [], []
+    for kw in np.unique(groups):
+        idx = np.flatnonzero(groups == kw)
+        if idx.size < 2:
+            continue
+        a = rng.choice(idx, size=min(per_keyword, idx.size * 3))
+        b = rng.choice(idx, size=a.size)
+        for i, j in zip(a, b):
+            if positions[i] == positions[j]:
+                continue        # the same slot, or the same row drawn twice
+            better, worse = (i, j) if positions[i] < positions[j] else (j, i)
+            hi.append(better)
+            lo.append(worse)
+    if not hi:
+        return None
+    return (torch.as_tensor(np.array(hi), dtype=torch.long),
+            torch.as_tensor(np.array(lo), dtype=torch.long))
+
+
 class Cancelled(Exception):
     """Raised out of the progress callback to stop a run.
 
@@ -49,20 +77,51 @@ class Cancelled(Exception):
     """
 
 
+# How much the ordering term counts against the top-N term.
+#
+# Not a tuned number, a stated priority: the two tasks are the same size because
+# both are the answer. "Would it reach the top ten" is what the verdict rests on
+# and "where in the page" is what the entry rank rests on, and the tool reports
+# both with equal confidence.
+PAIR_WEIGHT = 1.0
+
+
 def _fit_member(model, xm, xf, y, v, w, xs=None, xb=None, mask=None, rank=None,
-                epochs=400, lr=0.05, seed=0, on_epoch=None):
-    """Two heads, one trunk. The rank task is the objective; the downloads task
-    is a second signal over the same representation, which regularises it."""
+                pairs=None, epochs=400, lr=0.05, seed=0, on_epoch=None):
+    """Two heads, one trunk, and two things asked of the rank head.
+
+    The rank head is scored on whether an app reaches the top N, and its logit
+    is then used to ORDER the page - which is a different question, and one
+    nothing was training it to answer. Once two apps are both emphatically top
+    ten, cross-entropy has no gradient left and their relative order is whatever
+    the features happened to imply. That is exactly the region the entry rank
+    reads from: measured over 35 keywords the ordering correlated +0.68 with
+    Play overall while getting Play's OWN first app highest only 43% of the
+    time, so a new app kept slotting in above the leader.
+
+    `pairs` fixes the part that was never trained. For two apps on the same
+    page, the one Play put higher should score higher - which is a gradient
+    between two rows that are both correct on the top-N question, and therefore
+    the one thing cross-entropy cannot supply.
+    """
     torch.manual_seed(seed)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     known = ~torch.isnan(v)              # release date missing: no label, no gradient
     vt = torch.nan_to_num(v)
+    hi, lo = (pairs if pairs is not None else (None, None))
     for i in range(epochs):
         opt.zero_grad()
         # Rank on the rank-blind page, downloads on the ranked one: the two
         # inputs serving actually builds, in the same order.
-        loss = (F.binary_cross_entropy_with_logits(model(xm, xf, xb, mask), y,
+        logit = model(xm, xf, xb, mask)
+        loss = (F.binary_cross_entropy_with_logits(logit, y,
                                                    reduction="none") * w).mean()
+        if hi is not None and len(hi):
+            # softplus(-(a - b)) is -log sigmoid(a - b): zero when the better
+            # app already scores higher by a margin, and growing as the pair is
+            # got the wrong way round. The logits are the ones already computed,
+            # so the ordering term costs an indexing operation and no forward pass.
+            loss = loss + PAIR_WEIGHT * F.softplus(-(logit[hi] - logit[lo])).mean()
         if known.any():
             loss = loss + 0.3 * F.mse_loss(
                 model.velocity(xm, xf, xs, mask, rank)[known], vt[known])
@@ -193,10 +252,12 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
             parent, parent_blob = None, None    # shape changed: this is a fresh fit
     rng = np.random.default_rng(seed)
     idx_tr = np.flatnonzero(tr)
+    positions = np.array([m["position"] for m in data["meta"]])
     losses = []
     for i, member in enumerate(model.members):
         say("fitting", i, k, f"member {i + 1} of {k}")
         boot = rng.choice(idx_tr, size=len(idx_tr), replace=True)   # bootstrap resample
+        pairs = _pairs_within(data["groups"][boot], positions[boot], rng)
         losses.append(_fit_member(member,
                     torch.from_numpy(XM[boot]), torch.from_numpy(XF[boot]),
                     torch.from_numpy(y[boot]), torch.from_numpy(data["v"][boot]),
@@ -204,6 +265,7 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
                     xs=torch.from_numpy(XS[boot]), xb=torch.from_numpy(XB[boot]),
                     mask=torch.from_numpy(MK[boot]),
                     rank=torch.from_numpy(data["rank"][boot]),
+                    pairs=pairs,
                     epochs=epochs, lr=lr, seed=seed + i,
                     on_epoch=lambda e, l, _i=i: say(
                         "fitting", _i, k, f"member {_i + 1} of {k}, epoch {e}")))

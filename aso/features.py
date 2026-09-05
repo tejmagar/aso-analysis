@@ -153,6 +153,26 @@ REGISTRY: list[Feat] = [
          "what the nearest RECENTLY PUBLISHED on-intent app earns a year"),
     Feat("intent_recent_neighbour_gap", "free",
          "how many ranks away that recent app is: near is evidence, far is a guess"),
+    # What a title match is actually worth on THIS page.
+    #
+    # A count of how many apps carry the phrase says nothing about whether
+    # carrying it helps. On "falling blocks game" one app of thirty-six has the
+    # phrase in its title, which reads as an open door - and the truth is the
+    # opposite: Tetris holds rank 1 without a word of the phrase in its name,
+    # and the apps that do carry it start at rank 3. That is Play saying it
+    # knows what the phrase means and that spelling it out does not buy the top.
+    #
+    # The shape is common in games: a famous title holds the top and the
+    # phrase-matching imitations queue up beneath it.
+    Feat("leader_match", "free",
+         "does the app Play ranked first carry the phrase in its title"),
+    Feat("leader_relevance", "free", "how close the leader is to the phrase at all"),
+    Feat("leader_lead", "free",
+         "how far the leader towers over the rest of the page, in installs"),
+    Feat("first_match_rank", "free",
+         "where the highest app carrying the phrase sits, 0 if none does"),
+    Feat("match_starts_below", "free",
+         "how many ranks separate the top of the page from the first literal match"),
     Feat("field_staleness_p50", "free", "median days since the field last updated"),
     Feat("field_age_spread",    "free", "p90 minus p10 age: a multi-cohort field is a ladder"),
     Feat("field_age_known",     "free", "fraction of the field whose release date we actually have"),
@@ -336,6 +356,11 @@ def extract(app: dict, keyword: str, field: dict,
             math.log1p(field.get("intent_recent_neighbour_rate") or 0.0),
         "intent_recent_neighbour_gap":
             float(field.get("intent_recent_neighbour_gap") or 0.0),
+        "leader_match": float(field.get("leader_match") or 0.0),
+        "leader_relevance": float(field.get("leader_relevance") or 0.0),
+        "leader_lead": float(field.get("leader_lead") or 0.0),
+        "first_match_rank": float(field.get("first_match_rank") or 0),
+        "match_starts_below": float(field.get("match_starts_below") or 0),
         "field_measured_evidence": float(field.get("measured_count") or 0),
         # Paired with the rate, because a median over one app is a number and not
         # a measurement, and the model should be able to tell the difference.
@@ -448,6 +473,8 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
                 "intent_recent_rate_at_best": 0.0, "intent_neighbour_rate": 0.0,
                 "intent_neighbour_age": 0.0, "intent_recent_neighbour_rate": 0.0,
                 "intent_recent_neighbour_gap": 0.0,
+                "leader_match": 0.0, "leader_relevance": 0.0, "leader_lead": 0.0,
+                "first_match_rank": 0, "match_starts_below": 0,
                 "staleness_p50": 0, "newest_entrant_age": 0, "velocity_p50": 0,
                 "age_spread": 0, "age_known_frac": 0, "relevance_p50": 0,
                 "relevant_count": 0, "installs_p50_relevant": 0,
@@ -614,6 +641,39 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
         "reviews_p50":  float(np.percentile(revs, 50)),
         "exact_match_count": int(sum(exact_match(r.get("title") or "", keyword)
                                      for r in ranked)),
+        **_leader(ranked, keyword, rel, inst),
+    }
+
+
+def _leader(ranked, keyword, rel, inst) -> dict:
+    """What holding the top of this page took.
+
+    Read together these separate two pages that look identical to a count of
+    title matches: one where the phrase is unclaimed and a new app can take it,
+    and one where a famous app owns the meaning and the apps spelling the phrase
+    out are queued below it. The second is most of the games category.
+    """
+    if not ranked:
+        return {"leader_match": 0.0, "leader_relevance": 0.0, "leader_lead": 0.0,
+                "first_match_rank": 0, "match_starts_below": 0}
+    top = ranked[0]
+    matches = [i for i, r in enumerate(ranked, start=1)
+               if exact_match(r.get("title") or "", keyword)]
+    first = matches[0] if matches else 0
+    others = inst[1:] if inst.size > 1 else inst
+    lead = (math.log1p(inst[0]) - math.log1p(float(np.percentile(others, 50)))
+            if others.size else 0.0)
+    return {
+        "leader_match": 1.0 if exact_match(top.get("title") or "", keyword) else 0.0,
+        "leader_relevance": float(rel[0]) if rel.size else 0.0,
+        # In log units, so "ten times the median" and "a thousand times" are
+        # different numbers rather than both being "very large".
+        "leader_lead": float(lead),
+        "first_match_rank": first,
+        # 0 when the leader itself matches, and large when the phrase is spelled
+        # out only well down the page - which is the case that reads as an open
+        # door and is not one.
+        "match_starts_below": max(first - 1, 0) if first else 0,
     }
 
 
