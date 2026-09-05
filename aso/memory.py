@@ -125,10 +125,19 @@ def retire_stale(con, n_features: int) -> int:
         "SELECT id, features_json FROM residuals WHERE retired_at IS NULL")
         if len(json.loads(r["features_json"])) != n_features]
     if stale:
-        q = ",".join("?" * len(stale))
-        con.execute(f"UPDATE residuals SET retired_at=%s WHERE id IN ({q})",
-                    (now(), *stale))
-        con.commit()
+        # ANY(array), not an interpolated IN list. The list was built from "?"
+        # placeholders left over from SQLite, which Postgres does not accept, so
+        # this raised "1 placeholder but N parameters" and took the whole
+        # training run down with it - and only ever fired once the feature set
+        # had changed, which is exactly when a retrain matters most.
+        # No explicit commit. The connection is autocommit, so this lands on its
+        # own; and both callers here run inside `con.transaction()`, where
+        # psycopg refuses a manual commit outright. Retiring stale corrections
+        # is the last thing a training run does, so the exception landed after
+        # the model was already written and made the run look like it failed
+        # when the checkpoint was fine.
+        con.execute("UPDATE residuals SET retired_at=%s WHERE id = ANY(%s)",
+                    (now(), stale))
     return len(stale)
 
 
@@ -143,9 +152,8 @@ def retire(con, ids: list[int] | None = None) -> int:
     if ids is None:
         cur = con.execute("UPDATE residuals SET retired_at=%s WHERE retired_at IS NULL", (now(),))
     else:
-        q = ",".join("?" * len(ids))
         cur = con.execute(
-            f"UPDATE residuals SET retired_at=%s WHERE id IN ({q}) AND retired_at IS NULL",
-            (now(), *ids))
-    con.commit()
+            "UPDATE residuals SET retired_at=%s "
+            "WHERE id = ANY(%s) AND retired_at IS NULL",
+            (now(), list(ids)))
     return cur.rowcount

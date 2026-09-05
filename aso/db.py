@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import defaultdict
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -130,12 +131,22 @@ def add_observation(con, keyword, pkg, position, country="us",
         (keyword.strip().lower(), country, pkg, position, source, observed_at or now()))
 
 
-def latest_observations(con, country="us"):
-    """Most recent observation per (keyword, pkg). Older snapshots stay for history."""
+def latest_observations(con, country="us", keyword: str | None = None):
+    """Most recent observation per (keyword, pkg). Older snapshots stay for history.
+
+    `keyword` narrows the scan inside the query. That is not a micro-optimisation:
+    the one-keyword caller below used to pull the whole join and discard 99% of it
+    in Python, so building every field for training dragged the entire corpus
+    across the network once per keyword.
+    """
     # Newest row per (keyword, pkg), ties broken by insertion order so "latest"
     # is deterministic. A reviewed rank filed after a scrape supersedes it.
     # The derived table carries an alias because Postgres requires one.
-    return con.execute("""
+    where, params = "WHERE country = %s AND position IS NOT NULL", [country]
+    if keyword is not None:
+        where += " AND keyword = %s"
+        params.append(keyword.strip().lower())
+    return con.execute(f"""
         SELECT o.keyword, o.pkg, o.position, o.source, o.featured, o.observed_at, a.*
         FROM observations o
         JOIN apps a USING (pkg)
@@ -145,10 +156,10 @@ def latest_observations(con, country="us"):
                     PARTITION BY keyword, pkg
                     ORDER BY observed_at DESC, id DESC) AS rn
                 FROM observations
-                WHERE country = %s AND position IS NOT NULL
+                {where}
             ) ranked WHERE rn = 1
         )
-    """, (country,)).fetchall()
+    """, tuple(params)).fetchall()
 
 
 def set_override(con, keyword, field, value, country="us", reviewer="you") -> None:
@@ -241,12 +252,15 @@ def ranked_field(con, keyword: str, country="us") -> list[dict]:
     position, break ties in favour of the reviewed row, and hand out dense slots.
     `position` stays the raw observation; `slot` is the consistent one.
     """
-    rows = [dict(r) for r in latest_observations(con, country)
-            if r["keyword"] == keyword.strip().lower()]
+    rows = [dict(r) for r in latest_observations(con, country, keyword)]
+    return _slot(rows, measured_growth(con, [r["pkg"] for r in rows]))
+
+
+def _slot(rows: list[dict], growth: dict[str, float]) -> list[dict]:
+    """Shared body of the two readers above and below: order, then dense slots."""
     rows.sort(key=lambda r: (r["position"],
                              0 if r.get("source") == "review" else 1,
                              -(r.get("installs") or 0)))
-    growth = measured_growth(con, [r["pkg"] for r in rows])
     for i, r in enumerate(rows, start=1):
         r["slot"] = i
         r["position"] = i          # what every downstream reader uses
@@ -254,6 +268,21 @@ def ranked_field(con, keyword: str, country="us") -> list[dict]:
         # from measured at zero and has to stay distinguishable downstream.
         r["measured_per_day"] = growth.get(r["pkg"])
     return rows
+
+
+def ranked_fields(con, country="us") -> dict[str, list[dict]]:
+    """Every keyword's field, from one pass over the table.
+
+    Identical to calling ranked_field for each keyword, minus the round trips.
+    Training reads every field there is, and asking for them one at a time meant
+    258 full fetches of the same 6,000 rows.
+    """
+    by_kw: dict[str, list[dict]] = defaultdict(list)
+    for r in latest_observations(con, country):
+        by_kw[r["keyword"]].append(dict(r))
+    growth = measured_growth(
+        con, list({r["pkg"] for rows in by_kw.values() for r in rows}))
+    return {kw: _slot(rows, growth) for kw, rows in by_kw.items()}
 
 
 @contextmanager

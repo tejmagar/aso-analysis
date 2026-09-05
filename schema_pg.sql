@@ -122,8 +122,16 @@ CREATE TABLE IF NOT EXISTS registry (
     n_rows     BIGINT,
     golden_auc DOUBLE PRECISION,
     golden_ece DOUBLE PRECISION,
+    -- What the run actually fitted: per-member training loss, and the downloads
+    -- head's held-out error as a FACTOR rather than in log units. Kept per row
+    -- so two runs can be compared, which is the only way to tell a model that
+    -- improved from one that moved.
+    metrics    JSONB,
     active     BIGINT NOT NULL DEFAULT 0
 );
+-- A registry that predates the column above is upgraded in place. IF NOT EXISTS
+-- keeps this file re-runnable, which is what stands in for a migration step.
+ALTER TABLE registry ADD COLUMN IF NOT EXISTS metrics JSONB;
 
 -- Demand proxy from Play autocomplete. Separate from the ranker on purpose:
 -- nothing in a SERP encodes search volume, so this is its own small problem.

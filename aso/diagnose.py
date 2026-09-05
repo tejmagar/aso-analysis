@@ -61,6 +61,11 @@ def why(con, keyword: str, pkg: str, country: str = "us", top_n: int = 6) -> dic
     sf = features.Scaler.load(blob["scaler_free"])
 
     def score(feat: dict) -> float:
+        # No page rows here, so the attention context is absent for both sides
+        # of every comparison below. That is fine for what this measures - which
+        # single feature moves the logit furthest - because it is a difference
+        # between two vectors scored identically, but the absolute logits are
+        # not the ones serving sees.
         xm, xf = features.vectorize([feat])
         with torch.no_grad():
             return float(model.mean_logit(torch.from_numpy(sm.transform(xm)),

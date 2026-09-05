@@ -7,7 +7,6 @@ we can observe an app's FAILURES, which scraped rows never can.
 from __future__ import annotations
 
 import math
-from collections import defaultdict
 
 import numpy as np
 
@@ -18,15 +17,12 @@ NEW_APP_YEARS = 1.5  # only these carry a meaningful installs-per-year label
 
 
 def build(con, country: str = "us", top_n: int = TOP_K):
-    kws = [r["keyword"] for r in con.execute(
-        "SELECT DISTINCT keyword FROM observations WHERE country=%s", (country,))]
-    by_kw: dict[str, list[dict]] = {}
-    for kw in kws:
-        rs = db.ranked_field(con, kw, country)   # consistent slots, no collisions
-        if rs:
-            by_kw[kw] = rs
+    # One pass for every keyword. Per-keyword reads here fetched the whole
+    # observations join once each, which is minutes of network for one epoch.
+    by_kw = {kw: rs for kw, rs in db.ranked_fields(con, country).items() if rs}
 
     feats, labels, vel, groups, meta = [], [], [], [], []
+    pages, blind, masks, ranks = [], [], [], []
     for kw, rs in by_kw.items():
         kv = embed.keyword_vec(kw)
         feat_rows = db.featured_apps(con, kw, country)
@@ -47,6 +43,31 @@ def build(con, country: str = "us", top_n: int = TOP_K):
                 continue                       # nothing to compare against
             av = embed.app_vec(r.get("title") or "", r.get("short_desc") or "",
                               r.get("description") or "")
+            # The page this row was scored against, one row per app. Same
+            # leave-one-out and same rank as the aggregates above, so the two
+            # views of the field can never disagree about what was on it.
+            grp = intent.group_for(split, r["pkg"], vecs.get(r["pkg"]))
+            px, pm = features.page_matrix(
+                rs, kw, kw_vec=kv, app_vecs=vecs, intent_group=grp,
+                exclude_pkg=r["pkg"], at_rank=r["position"])
+            # The same page with the rank withheld.
+            #
+            # Serving asks the two questions in two passes: the rank head runs
+            # first, when the app has no rank yet, and only then can the
+            # downloads head be asked "at THAT rank". So the rank task is
+            # trained on the page without rank_gap and the downloads task on
+            # the page with it, which is exactly the pair serving produces. Feed
+            # both heads the ranked page and every serving rank prediction is
+            # made on an input shape that never occurred in training.
+            bx, _ = features.page_matrix(
+                rs, kw, kw_vec=kv, app_vecs=vecs, intent_group=grp,
+                exclude_pkg=r["pkg"], at_rank=None)
+            pages.append(px)
+            blind.append(bx)
+            masks.append(pm)
+            # The rank this row actually held, on the same scale serving uses
+            # for the rank a new app would enter at.
+            ranks.append((r["position"] - 1) / 10.0)
             feats.append(features.extract(r, kw, fld, kv, av, sg))
             labels.append(1.0 if r["position"] <= top_n else 0.0)
             # The downloads label: what this app achieved per year since release.
@@ -73,6 +94,8 @@ def build(con, country: str = "us", top_n: int = TOP_K):
     xm, xf = features.vectorize(feats)
     return {"xm": xm, "xf": xf, "y": np.array(labels, "float32"),
             "v": np.array(vel, "float32"),
+            "xs": np.stack(pages), "xs_blind": np.stack(blind),
+            "mask": np.stack(masks), "rank": np.array(ranks, "float32"),
             "groups": np.array(groups), "meta": meta, "feats": feats}
 
 

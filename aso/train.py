@@ -6,7 +6,7 @@ and a model that agrees with whoever used the CLI most.
 """
 from __future__ import annotations
 
-import json
+import json as _json
 import os
 from pathlib import Path
 
@@ -36,8 +36,8 @@ MIN_KEYWORDS = 25
 MIN_AUC = 0.55        # only enforced once the split is measurable
 
 
-def _fit_member(model, xm, xf, y, v, w, epochs=400, lr=0.05, seed=0,
-                on_epoch=None):
+def _fit_member(model, xm, xf, y, v, w, xs=None, xb=None, mask=None, rank=None,
+                epochs=400, lr=0.05, seed=0, on_epoch=None):
     """Two heads, one trunk. The rank task is the objective; the downloads task
     is a second signal over the same representation, which regularises it."""
     torch.manual_seed(seed)
@@ -46,10 +46,13 @@ def _fit_member(model, xm, xf, y, v, w, epochs=400, lr=0.05, seed=0,
     vt = torch.nan_to_num(v)
     for i in range(epochs):
         opt.zero_grad()
-        loss = (F.binary_cross_entropy_with_logits(model(xm, xf), y,
+        # Rank on the rank-blind page, downloads on the ranked one: the two
+        # inputs serving actually builds, in the same order.
+        loss = (F.binary_cross_entropy_with_logits(model(xm, xf, xb, mask), y,
                                                    reduction="none") * w).mean()
         if known.any():
-            loss = loss + 0.3 * F.mse_loss(model.velocity(xm, xf)[known], vt[known])
+            loss = loss + 0.3 * F.mse_loss(
+                model.velocity(xm, xf, xs, mask, rank)[known], vt[known])
         loss.backward()
         opt.step()
         # Report every 50 epochs rather than every one: the callback writes to
@@ -86,6 +89,19 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
     sm = features.Scaler().fit(data["xm"][tr])
     sf = features.Scaler().fit(data["xf"][tr])
     XM, XF = sm.transform(data["xm"]), sf.transform(data["xf"])
+    # The page rows are scaled per column over the REAL apps only. Fitting over
+    # the zero padding too would drag every mean toward zero by however many
+    # slots happened to be empty, which is a property of short pages and not of
+    # apps. Padding is re-zeroed after transform so it stays inert.
+    XS, XB, MK = data["xs"], data["xs_blind"], data["mask"]
+    real = MK[tr].reshape(-1) > 0.5
+    ss = features.Scaler().fit(XS[tr].reshape(-1, XS.shape[-1])[real])
+
+    def _scale_pages(A):
+        return (ss.transform(A.reshape(-1, A.shape[-1]))
+                .reshape(A.shape) * MK[..., None])
+
+    XS, XB = _scale_pages(XS), _scale_pages(XB)
     y = data["y"]
 
     # Weight by what a row actually demonstrates, not by who owns the app.
@@ -123,27 +139,66 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
 
     say("fitting", 0, k, f"{len(y)} rows across "
         f"{len(np.unique(data['groups']))} keywords")
-    model = Ensemble(XM.shape[1], XF.shape[1], k=k, hidden=hidden)
+    model = Ensemble(XM.shape[1], XF.shape[1], k=k, hidden=hidden,
+                     n_app=XS.shape[-1])
     rng = np.random.default_rng(seed)
     idx_tr = np.flatnonzero(tr)
+    losses = []
     for i, member in enumerate(model.members):
         say("fitting", i, k, f"member {i + 1} of {k}")
         boot = rng.choice(idx_tr, size=len(idx_tr), replace=True)   # bootstrap resample
-        _fit_member(member,
+        losses.append(_fit_member(member,
                     torch.from_numpy(XM[boot]), torch.from_numpy(XF[boot]),
                     torch.from_numpy(y[boot]), torch.from_numpy(data["v"][boot]),
                     torch.from_numpy(w[boot].astype("float32")),
+                    xs=torch.from_numpy(XS[boot]), xb=torch.from_numpy(XB[boot]),
+                    mask=torch.from_numpy(MK[boot]),
+                    rank=torch.from_numpy(data["rank"][boot]),
                     epochs=epochs, lr=0.05, seed=seed + i,
                     on_epoch=lambda e, l, _i=i: say(
-                        "fitting", _i, k, f"member {_i + 1} of {k}, epoch {e}"))
+                        "fitting", _i, k, f"member {_i + 1} of {k}, epoch {e}")))
 
     say("scoring", k, k, "measuring against the held-out keywords")
     model.eval()
     with torch.no_grad():
-        p_ho, _ = model(torch.from_numpy(XM[ho]), torch.from_numpy(XF[ho]))
-        logits_all = model.mean_logit(torch.from_numpy(XM), torch.from_numpy(XF)).numpy()
+        p_ho, _ = model(torch.from_numpy(XM[ho]), torch.from_numpy(XF[ho]),
+                        torch.from_numpy(XB[ho]), torch.from_numpy(MK[ho]))
+        logits_all = model.mean_logit(
+            torch.from_numpy(XM), torch.from_numpy(XF),
+            torch.from_numpy(XB), torch.from_numpy(MK)).numpy()
     p_ho = p_ho.numpy()
     g_auc, g_ece = metrics.auc(y[ho], p_ho), metrics.ece(y[ho], p_ho)
+
+    # The downloads head, measured on the same held-out keywords.
+    #
+    # Nothing scored this before, so a run could be reported as good on the
+    # strength of its rank AUC while the downloads number was wandering by
+    # multiples between retrains. It wanders because the head regresses
+    # log1p(installs per year) and the answer is exponentiated back: an error of
+    # 1.4 in log space is a four-fold error on screen, which is invisible in any
+    # loss printed in log units. So the honest figure is a RATIO - typically how
+    # many times out the answer is - and that is what gets recorded.
+    with torch.no_grad():
+        v_ho, v_spread = model.velocity(
+            torch.from_numpy(XM[ho]), torch.from_numpy(XF[ho]),
+            torch.from_numpy(XS[ho]), torch.from_numpy(MK[ho]),
+            torch.from_numpy(data["rank"][ho]))
+    v_true = data["v"][ho]
+    lab = ~np.isnan(v_true)
+    if lab.sum():
+        err = np.abs(v_ho.numpy()[lab] - v_true[lab])
+        pred_n = np.expm1(np.clip(v_ho.numpy()[lab], 0, 30))
+        true_n = np.expm1(np.clip(v_true[lab], 0, 30))
+        ratio = np.maximum(pred_n, 1.0) / np.maximum(true_n, 1.0)
+        ratio = np.maximum(ratio, 1.0 / np.maximum(ratio, 1e-9))   # always >= 1x
+        vel = {"n": int(lab.sum()),
+               "mae_log": float(err.mean()),
+               "factor_p50": float(np.percentile(ratio, 50)),
+               "factor_p90": float(np.percentile(ratio, 90)),
+               "spread_log_p50": float(np.percentile(v_spread.numpy()[lab], 50))}
+    else:
+        vel = {"n": 0, "mae_log": None, "factor_p50": None,
+               "factor_p90": None, "spread_log_p50": None}
 
     meta = {
         "features": [f.name for f in features.REGISTRY],
@@ -155,6 +210,15 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
             np.nanmax(data["v"])) else 0.0,
         # reference quantiles: turn a raw logit into a 0-100 fit/crowding score
         "logit_q": np.percentile(logits_all, np.arange(0, 101)).tolist(),
+        "page_features": features.PAGE_FEATS,
+        # What this run actually fitted, kept so two runs can be compared
+        # instead of only the newest being visible.
+        "train_loss": {"per_member": [round(x, 4) for x in losses],
+                       "mean": float(np.mean(losses)) if losses else None,
+                       "spread": float(np.std(losses)) if losses else None},
+        "downloads": vel,
+        "labelled_rows": int((~np.isnan(data["v"])).sum()),
+        "epochs": int(epochs), "seed": int(seed), "members": int(k),
     }
 
     # Two independent gates. The relative one stops a regression; the absolute
@@ -171,12 +235,18 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
     gated = regressed or no_signal
     version = f"v{db.scalar(con, 'SELECT COUNT(*) FROM registry') + 1}"
     path = MODELS / f"{version}.pt"
-    model.save(path, sm.state(), sf.state(), meta)
+    model.save(path, sm.state(), sf.state(), meta, scaler_set=ss.state())
 
     with con.transaction():
         con.execute("INSERT INTO registry (version, path, created_at, n_rows, "
-                    "golden_auc, golden_ece, active) VALUES (%s,%s,%s,%s,%s,%s,0)",
-                    (version, str(path), db.now(), len(y), g_auc, g_ece))
+                    "golden_auc, golden_ece, metrics, active) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,0)",
+                    (version, str(path), db.now(), len(y), g_auc, g_ece,
+                     _json.dumps({"train_loss": meta["train_loss"],
+                                  "downloads": vel,
+                                  "labelled_rows": meta["labelled_rows"],
+                                  "epochs": epochs, "seed": seed,
+                                  "members": k})))
         if not gated:
             con.execute("UPDATE registry SET active=0")
             con.execute("UPDATE registry SET active=1 WHERE version=%s", (version,))
@@ -188,7 +258,8 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
             # was quietly overwriting the checkpoint a fresh clone would get.
             if measurable:
                 model.save(SHIPPED, sm.state(), sf.state(),
-                           {**meta, "version": version, "promoted_at": db.now()})
+                           {**meta, "version": version, "promoted_at": db.now()},
+                           scaler_set=ss.state())
             con.execute("UPDATE corrections SET status='absorbed' WHERE status='queued'")
             _retire_learned(con, model, sm, sf)
 
@@ -199,6 +270,19 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
             print(f"  ! only {meta['n_keywords']} keywords: the golden split is a "
                   f"single keyword and its score is noise, not a measurement")
         print(f"  golden AUC {g_auc:.3f}  ECE {g_ece:.3f}")
+        tl = meta["train_loss"]
+        print(f"  train loss {tl['mean']:.4f} +/- {tl['spread']:.4f} across "
+              f"{len(tl['per_member'])} members")
+        if vel["n"]:
+            # Reported as a factor, not in log units, because that is the error
+            # the reader sees: 6x means an app really earning 100 a day is shown
+            # somewhere between 17 and 600.
+            print(f"  downloads head: typically {vel['factor_p50']:.1f}x out, "
+                  f"{vel['factor_p90']:.1f}x at the 90th percentile "
+                  f"({vel['n']} held-out labels)")
+        else:
+            print("  downloads head: NOT MEASURED - no held-out row carries a "
+                  "downloads label, so the number it produces is unvalidated")
         if not measurable:
             print(f"  promoted: {version} is now active "
                   f"({meta['n_keywords']}/{MIN_KEYWORDS} keywords, not yet validated)")
@@ -224,20 +308,22 @@ def bootstrap(con, k=7, hidden=24):
     improving; this way there is always a prediction, and the registry records
     how much data stood behind it.
     """
-    import json as _json
 
     from . import features as F
-    model = Ensemble(len(F.MONO), len(F.FREE), k=k, hidden=hidden)
+    model = Ensemble(len(F.MONO), len(F.FREE), k=k, hidden=hidden,
+                     n_app=len(F.PAGE_FEATS))
     model.eval()
     n_feat = len(F.REGISTRY)
     ident = {"mean": [0.0] * len(F.MONO), "std": [1.0] * len(F.MONO)}
     identf = {"mean": [0.0] * len(F.FREE), "std": [1.0] * len(F.FREE)}
-    meta = {"features": [f.name for f in F.REGISTRY], "n_rows": 0, "n_keywords": 0,
+    meta = {"features": [f.name for f in F.REGISTRY],
+            "page_features": F.PAGE_FEATS, "n_rows": 0, "n_keywords": 0,
             "golden_auc": 0.5, "golden_ece": 0.5, "untrained": True,
             "logit_q": np.linspace(-4, 4, 101).tolist()}
     version = "v0"
     path = MODELS / "v0.pt"
-    model.save(path, ident, identf, meta)
+    idents = {"mean": [0.0] * len(F.PAGE_FEATS), "std": [1.0] * len(F.PAGE_FEATS)}
+    model.save(path, ident, identf, meta, scaler_set=idents)
     with con.transaction():
         # Clear the flag first. Without this the bootstrap adds a second active
         # row beside a real trained one, and "the active model" becomes whichever
@@ -260,6 +346,12 @@ def _usable(path):
     except (FileNotFoundError, RuntimeError, EOFError):
         return None
     if blob["meta"].get("features") != [f.name for f in F.REGISTRY]:
+        return None
+    # The page rows are an input too, and changing them invalidates a checkpoint
+    # exactly as changing the scalar features does. Left unchecked, a model
+    # trained on a different set of per-app columns loads without complaint and
+    # answers confidently from weights that mean something else.
+    if blob["meta"].get("page_features") != F.PAGE_FEATS:
         return None
     return model, blob
 
@@ -310,7 +402,6 @@ def _retire_learned(con, model, sm, sf, tol=0.5) -> int:
     visible: a residual that never retires is the model telling you it does not
     believe the correction.
     """
-    import json as _json
 
     n_feat = len(features.REGISTRY)
     dropped = memory.retire_stale(con, n_feat)

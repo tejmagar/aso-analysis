@@ -119,6 +119,40 @@ REGISTRY: list[Feat] = [
     Feat("intent_measured_velocity", "dec",
          "measured growth inside your meaning, between two dated observations"),
     Feat("intent_evidence", "free", "how many on-intent apps those rates cover"),
+    # Where Play's answer stops and its padding starts.
+    #
+    # A narrow phrase does not return a page of competitors, it returns the few
+    # apps that answer it and then whatever fills the rest: "energy ring notch"
+    # has seven real answers, then Roblox, Google and Clock. Nothing above told
+    # the model that, so it read a 21-a-day niche through the download rate of
+    # apps with three billion installs. The cut is the last rank of the unbroken
+    # on-intent run from the top, so Play's own ordering decides it.
+    Feat("intent_cut", "free", "last rank before the page stops answering the phrase"),
+    Feat("intent_cut_share", "free", "what fraction of the visible page is real answers"),
+    Feat("intent_relevance_drop", "free",
+         "how far relevance falls from rank 1 to the bottom of the window"),
+    # The recent on-intent apps IN RANK ORDER, which is the closest thing a page
+    # holds to the question being asked: somebody published into this exact
+    # meaning recently, and Play gave them a rank. Collapsed to a median these
+    # say nothing about entering at a given depth, which is what is being asked.
+    Feat("intent_recent_best_rank", "free",
+         "best rank any recently published on-intent app holds"),
+    Feat("intent_recent_rate_at_best", "free",
+         "what that recently published app earns a year"),
+    Feat("intent_neighbour_rate", "free",
+         "what the on-intent app nearest your own rank earns a year"),
+    # Rank and downloads are not the same axis, and conflating them is the
+    # failure this guards. A ten-year-old giant can sit at rank 10 on a lifetime
+    # average of thousands a day while genuinely new apps hold ranks 1 and 2 on
+    # twenty. Reading the neighbour's rate without its age turns the first into
+    # a forecast for the second, so the age travels with the rate and the model
+    # decides what a rate from an app that old is worth.
+    Feat("intent_neighbour_age", "free",
+         "how old that nearest on-intent app is, in years"),
+    Feat("intent_recent_neighbour_rate", "free",
+         "what the nearest RECENTLY PUBLISHED on-intent app earns a year"),
+    Feat("intent_recent_neighbour_gap", "free",
+         "how many ranks away that recent app is: near is evidence, far is a guess"),
     Feat("field_staleness_p50", "free", "median days since the field last updated"),
     Feat("field_age_spread",    "free", "p90 minus p10 age: a multi-cohort field is a ladder"),
     Feat("field_age_known",     "free", "fraction of the field whose release date we actually have"),
@@ -290,6 +324,18 @@ def extract(app: dict, keyword: str, field: dict,
         "intent_recent_velocity": math.log1p(field.get("intent_recent_velocity") or 0.0),
         "intent_measured_velocity": math.log1p(field.get("intent_measured_velocity") or 0.0),
         "intent_evidence": float(field.get("intent_evidence") or 0),
+        "intent_cut": float(field.get("intent_cut") or 0),
+        "intent_cut_share": float(field.get("intent_cut_share") or 0.0),
+        "intent_relevance_drop": float(field.get("intent_relevance_drop") or 0.0),
+        "intent_recent_best_rank": float(field.get("intent_recent_best_rank") or 0),
+        "intent_recent_rate_at_best":
+            math.log1p(field.get("intent_recent_rate_at_best") or 0.0),
+        "intent_neighbour_rate": math.log1p(field.get("intent_neighbour_rate") or 0.0),
+        "intent_neighbour_age": float(field.get("intent_neighbour_age") or 0.0),
+        "intent_recent_neighbour_rate":
+            math.log1p(field.get("intent_recent_neighbour_rate") or 0.0),
+        "intent_recent_neighbour_gap":
+            float(field.get("intent_recent_neighbour_gap") or 0.0),
         "field_measured_evidence": float(field.get("measured_count") or 0),
         # Paired with the rate, because a median over one app is a number and not
         # a measurement, and the model should be able to tell the difference.
@@ -303,6 +349,23 @@ def extract(app: dict, keyword: str, field: dict,
         "days_since_update":  _days_since(app.get("updated_at")) / 365.0,
         **{k: float((sugg or {}).get(k, v)) for k, v in SUGG_DEFAULTS.items()},
     }
+
+
+def _cos(a, b) -> float:
+    """Cosine between two app vectors, 0.0 when either is missing."""
+    if a is None or b is None:
+        return 0.0
+    na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+def _rate_of(row) -> float:
+    """One app's installs per year. Floored at a quarter year so an app released
+    last week does not divide by ~0 and report an absurd rate."""
+    age = _days_since(row.get("released_at")) / 365.0
+    return (row.get("installs") or 0) / max(age, 0.25) if age > 0 else 0.0
 
 
 def _rates(rows) -> dict:
@@ -359,7 +422,8 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
                   exclude_pkg: str | None = None,
                   featured: list[dict] | None = None,
                   kw_vec=None, app_vecs: dict | None = None,
-                  intent_group: dict | None = None) -> dict:
+                  intent_group: dict | None = None,
+                  at_rank: int | None = None) -> dict:
     """Summarise the competitive field by QUANTILES, not means.
 
     A field holding one giant and nine small apps behaves nothing like ten
@@ -379,7 +443,11 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
                 "newcomer_velocity": 0.0, "measured_velocity": 0.0,
                 "measured_count": 0, "intent_velocity": 0.0,
                 "intent_recent_velocity": 0.0, "intent_measured_velocity": 0.0,
-                "intent_evidence": 0,
+                "intent_evidence": 0, "intent_cut": 0, "intent_cut_share": 0.0,
+                "intent_relevance_drop": 0.0, "intent_recent_best_rank": 0,
+                "intent_recent_rate_at_best": 0.0, "intent_neighbour_rate": 0.0,
+                "intent_neighbour_age": 0.0, "intent_recent_neighbour_rate": 0.0,
+                "intent_recent_neighbour_gap": 0.0,
                 "staleness_p50": 0, "newest_entrant_age": 0, "velocity_p50": 0,
                 "age_spread": 0, "age_known_frac": 0, "relevance_p50": 0,
                 "relevant_count": 0, "installs_p50_relevant": 0,
@@ -397,11 +465,6 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
     stale = np.array([_days_since(r.get("updated_at")) for r in ranked])
     known = ages[ages > 0]
     recent = [r for r, a in zip(ranked, ages) if 0 < a <= 1.0]
-
-    # Installs per year, floored at a quarter year so a brand new app does not
-    # divide by ~0 and report an absurd rate.
-    vel = np.array([(r.get("installs") or 0) / max(a, 0.25)
-                    for r, a in zip(ranked, ages) if a > 0])
 
     rel = np.array([app_relevance(r, keyword, kw_vec, _vec_for(r, app_vecs))
                     for r in ranked])
@@ -431,6 +494,61 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
     # apps that are not competing with you at all, and their numbers are not
     # evidence about what you would earn.
     page, mine = _rates(ranked), _rates(on_intent)
+
+    # Where the answer stops and the filler starts.
+    #
+    # An unbroken run of on-intent apps from rank 1, and the rank it ends at.
+    # Contiguity is the whole point: Play puts what it believes answers the
+    # phrase first, so a break in the run is the page changing subject. Anything
+    # past it is padding, and its download rates are not a market a new app
+    # could earn from.
+    on_ranks = sorted(r["position"] for r in on_intent)
+    cut = 0
+    for i, pos in enumerate(on_ranks, start=1):
+        if pos != i:
+            break
+        cut = i
+
+    # How hard relevance falls across the window. A page that answers all the
+    # way down and a page that gives up after two both have on-intent apps; only
+    # this separates them.
+    drop = float(rel[0] - rel[-1]) if rel.size > 1 else 0.0
+
+    # The recent on-intent apps, in rank order. A newcomer holding rank 2 says
+    # something a newcomer at rank 30 does not, and a median over the cohort
+    # throws exactly that away.
+    recent_intent = sorted(
+        (r for r in on_intent
+         if 0 < _days_since(r.get("released_at")) / 365.0 <= 1.0),
+        key=lambda r: r["position"])
+    best = recent_intent[0] if recent_intent else None
+
+    # What the on-intent app nearest your own rank earns. For a row in the SERP
+    # that rank is its own; for an app not on the page it is the rank it would
+    # enter at, which the caller supplies after the rank head has run.
+    own_rank = at_rank
+    if own_rank is None and exclude_pkg:
+        own = next((r for r in rows
+                    if r.get("pkg") == exclude_pkg and r.get("position")), None)
+        own_rank = own["position"] if own else None
+    if own_rank and on_intent:
+        near = min(on_intent, key=lambda r: abs(r["position"] - own_rank))
+        neighbour = _rate_of(near)
+        neighbour_age = _days_since(near.get("released_at")) / 365.0
+    else:
+        near, neighbour, neighbour_age = None, 0.0, 0.0
+
+    # The same neighbour, restricted to apps that actually launched recently.
+    # This is the one the question is really about: a rate earned by an app that
+    # started from nothing near your rank, rather than a lifetime average banked
+    # by an app that has held its slot since before the phrase existed. The gap
+    # is how far away it sits, because the evidence is only as good as it is near.
+    if own_rank and recent_intent:
+        rnear = min(recent_intent, key=lambda r: abs(r["position"] - own_rank))
+        recent_neighbour = _rate_of(rnear)
+        recent_gap = abs(rnear["position"] - own_rank)
+    else:
+        recent_neighbour, recent_gap = 0.0, 0.0
 
     return {
         "n": len(ranked),
@@ -470,6 +588,23 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
         "measured_velocity": page["measured"],
         "measured_count": page["measured_n"],
         "newcomers": len(recent),
+        # And all of it again over the apps answering the same question, which
+        # is the set a new app would actually be joining. Computed and then
+        # dropped on the floor in the first version of this, so every one of
+        # them trained as a constant zero.
+        "intent_velocity": mine["all"],
+        "intent_recent_velocity": mine["recent"],
+        "intent_measured_velocity": mine["measured"],
+        "intent_evidence": len(on_intent),
+        "intent_cut": cut,
+        "intent_cut_share": float(cut / max(len(ranked), 1)),
+        "intent_relevance_drop": drop,
+        "intent_recent_best_rank": best["position"] if best else 0,
+        "intent_recent_rate_at_best": _rate_of(best) if best else 0.0,
+        "intent_neighbour_rate": neighbour,
+        "intent_neighbour_age": neighbour_age,
+        "intent_recent_neighbour_rate": recent_neighbour,
+        "intent_recent_neighbour_gap": recent_gap,
         "newcomer_installs": max((r.get("installs") or 0) for r in recent) if recent else 0,
         "staleness_p50": float(np.percentile(stale, 50)) if stale.size else 0.0,
         "installs_p10": float(np.percentile(inst, 10)),
@@ -544,3 +679,101 @@ LEAKS_DOWNLOADS = {"app_velocity", "log_installs", "log_reviews"}
 
 VEL_MASK_MONO = np.array([f.name not in LEAKS_DOWNLOADS for f in MONO], dtype="float32")
 VEL_MASK_FREE = np.array([f.name not in LEAKS_DOWNLOADS for f in FREE], dtype="float32")
+
+
+# ---------------------------------------------------------------------------
+# The page as a SET, not as a summary.
+#
+# Every field feature above is an aggregate: a median, a p90, a count, a rate
+# over some subset we chose. Aggregates cannot express the relation that
+# actually answers "how many downloads would I get", which is per-app and reads
+# roughly: THIS app, at THIS rank, THIS old, earns THIS much. Collapsing the
+# page to quantiles destroys it, and every attempt to rescue it by hand - the
+# relevant subset, the on-intent subset, the nearest neighbour by rank - is
+# another formula written by us about a page that Play assembled for reasons
+# including gap-filling and taste. Those are not recoverable by arithmetic over
+# medians, so the arithmetic stops here: the rows go to the model whole and it
+# learns which ones matter.
+#
+# One row per app, fixed width, zero-padded to MAX_APPS with a mask.
+PAGE_FEATS = [
+    "rank",              # where Play put it
+    "rank_gap",          # its rank minus yours: how the attention finds neighbours
+    "gap_known",         # 0 when the asking app has no rank yet
+    "log_installs",
+    "log_rate",          # installs per year over its life
+    "age",               # years since release
+    "age_known",
+    "log_measured",      # installs per year measured between two snapshots
+    "measured_known",    # measured at zero and never measured are different
+    "rating",
+    "log_reviews",
+    "relevance",         # cosine to the keyword
+    "on_intent",         # in the group answering the same question
+    # Intent is not a boundary, it is a slope.
+    #
+    # Play puts what it is most confident about first and the match fades down
+    # the page, so on "down detector" the outage app at rank 1 and the speed
+    # test at rank 2 are both answering the phrase while rank 18 is not. A
+    # clustering threshold has to draw a line somewhere in that slope, and
+    # wherever it draws it the copy ends up claiming one app answers the phrase
+    # when two clearly do. These two carry the slope itself - how close this app
+    # is to what Play ranked first, and to the phrase - and the rank column
+    # carries the position, so the model can learn the fade instead of being
+    # handed our guess at where it ends.
+    "sim_to_top",        # cosine to the app Play ranked first
+    "top_rank_gap",      # ranks between this app and that one
+    "title_exact",       # carries the phrase in its title
+    "staleness",         # years since it last shipped an update
+    "featured",          # Play's promoted card
+]
+MAX_APPS = 12
+
+
+def page_matrix(rows: list[dict], keyword: str, kw_vec=None,
+                app_vecs: dict | None = None, intent_group: dict | None = None,
+                exclude_pkg: str | None = None, at_rank: int | None = None,
+                max_apps: int = MAX_APPS) -> tuple[np.ndarray, np.ndarray]:
+    """The ranked page as (MAX_APPS, len(PAGE_FEATS)) plus a presence mask.
+
+    Leave-one-out on the same terms as compute_field: an app is never shown its
+    own row, because at prediction time the asking app is not on the page.
+    """
+    pool = [r for r in rows if r.get("position") and r.get("pkg") != exclude_pkg]
+    ranked = sorted(pool, key=lambda r: r["position"])[:max_apps]
+    members = set((intent_group or {}).get("packages") or ())
+    kw = keyword.strip().lower()
+
+    # The anchor is whatever Play ranked first among the apps actually present,
+    # which after leave-one-out may not be position 1.
+    top = ranked[0] if ranked else None
+    top_vec = _vec_for(top, app_vecs) if top is not None else None
+    top_rank = top["position"] if top is not None else 0
+
+    X = np.zeros((max_apps, len(PAGE_FEATS)), dtype="float32")
+    mask = np.zeros(max_apps, dtype="float32")
+    for i, r in enumerate(ranked):
+        age = _days_since(r.get("released_at")) / 365.0
+        measured = r.get("measured_per_day")
+        X[i] = [
+            r["position"] / 10.0,
+            ((r["position"] - at_rank) / 10.0) if at_rank else 0.0,
+            1.0 if at_rank else 0.0,
+            math.log1p(r.get("installs") or 0),
+            math.log1p(_rate_of(r)),
+            min(age, 15.0) if age > 0 else 0.0,
+            1.0 if age > 0 else 0.0,
+            math.log1p((measured or 0.0) * 365.0),
+            1.0 if measured is not None else 0.0,
+            float(r.get("rating") or 0.0),
+            math.log1p(r.get("reviews") or 0),
+            app_relevance(r, keyword, kw_vec, _vec_for(r, app_vecs)),
+            1.0 if r.get("pkg") in members else 0.0,
+            _cos(_vec_for(r, app_vecs), top_vec),
+            (r["position"] - top_rank) / 10.0,
+            1.0 if kw in (r.get("title") or "").lower() else 0.0,
+            min(_days_since(r.get("updated_at")) / 365.0, 10.0),
+            float(r.get("featured") or 0),
+        ]
+        mask[i] = 1.0
+    return X, mask

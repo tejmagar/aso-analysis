@@ -30,19 +30,49 @@ def scale_all(sm, sf, V: np.ndarray) -> np.ndarray:
     return np.concatenate([sm.transform(V[:, :k]), sf.transform(V[:, k:])], axis=1)
 
 
-def _logits(model, sm, sf, feats) -> np.ndarray:
+def _logits(model, sm, sf, feats, ss=None, pages=None, masks=None) -> np.ndarray:
     xm, xf = features.vectorize(feats)
+    xs, mk = _pages(ss, pages, masks)
     with torch.no_grad():
         return model.mean_logit(torch.from_numpy(sm.transform(xm)),
-                                torch.from_numpy(sf.transform(xf))).numpy()
+                                torch.from_numpy(sf.transform(xf)), xs, mk).numpy()
 
 
-def _feat_for(row, keyword, rows, kv, featured=None, vecs=None, sugg=None, split=None):
+def _pages(ss, pages, masks):
+    """Scale a batch of page matrices the way training did, padding kept inert.
+
+    Returns (None, None) for a model saved before the page encoder existed, so
+    an older checkpoint in the registry still loads and still answers.
+    """
+    if ss is None or not pages:
+        return None, None
+    xs = np.stack(pages)
+    mk = np.stack(masks).astype("float32")
+    xs = (ss.transform(xs.reshape(-1, xs.shape[-1]))
+          .reshape(xs.shape) * mk[..., None])
+    return torch.from_numpy(xs), torch.from_numpy(mk)
+
+
+def _page_for(row, keyword, rows, kv, vecs=None, split=None, at_rank=None):
+    grp = (intent.group_for(split, row.get("pkg"), vecs.get(row.get("pkg")) if vecs else None)
+           if split else None)
+    return features.page_matrix(rows, keyword, kw_vec=kv, app_vecs=vecs,
+                                intent_group=grp, exclude_pkg=row.get("pkg"),
+                                at_rank=at_rank)
+
+
+def _set_scaler(blob):
+    st = blob.get("scaler_set")
+    return features.Scaler.load(st) if st else None
+
+
+def _feat_for(row, keyword, rows, kv, featured=None, vecs=None, sugg=None, split=None,
+              at_rank=None):
     grp = (intent.group_for(split, row.get("pkg"), vecs.get(row.get("pkg")) if vecs else None)
            if split else None)
     fld = features.compute_field(rows, keyword, top_n=TOP_K, exclude_pkg=row.get("pkg"),
                                  featured=featured, kw_vec=kv, app_vecs=vecs,
-                                 intent_group=grp)
+                                 intent_group=grp, at_rank=at_rank)
     av = embed.app_vec(row.get("title") or "", row.get("short_desc") or "",
                       row.get("description") or "")
     return features.extract(row, keyword, fld, kv, av, sugg)
@@ -78,9 +108,14 @@ def score(con, pkg: str, keyword: str, country="us", record=True):
                               r.get("description") or "")
             for r in rows + featured + [app]}
     split = intent.split(rows, vecs, kv)
+    ss = _set_scaler(blob)
     feats = [_feat_for(r, keyword, rows, kv, featured, vecs, sg, split) for r in ranked]
+    pages = [_page_for(r, keyword, rows, kv, vecs, split, r["position"]) for r in ranked]
     cand_feat = _feat_for(app, keyword, rows, kv, featured, vecs, sg, split)
-    all_logits = _logits(model, sm, sf, feats + [cand_feat])
+    cand_page = _page_for(app, keyword, rows, kv, vecs, split, app.get("position"))
+    all_logits = _logits(model, sm, sf, feats + [cand_feat], ss,
+                         [x for x, _ in pages] + [cand_page[0]],
+                         [m for _, m in pages] + [cand_page[1]])
     field_logits, base_logit = all_logits[:-1], float(all_logits[-1])
     inc_logits = np.array([lg for lg, r in zip(field_logits, ranked)
                            if r["pkg"] != pkg], dtype="float32")
@@ -185,8 +220,13 @@ def score_entry(con, keyword: str, country="us"):
                                  rows_today=rows)}
     split = intent.split(rows, vecs, kv)
     feats = [_feat_for(r, keyword, rows, kv, featured, vecs, sg, split) for r in ranked]
+    ss = _set_scaler(blob)
+    pages = [_page_for(r, keyword, rows, kv, vecs, split, r["position"]) for r in ranked]
     ghost_feat = _feat_for(ghost, keyword, rows, kv, featured, vecs, sg, split)
-    lg = _logits(model, sm, sf, feats + [ghost_feat])
+    ghost_page = _page_for(ghost, keyword, rows, kv, vecs, split)
+    lg = _logits(model, sm, sf, feats + [ghost_feat], ss,
+                 [x for x, _ in pages] + [ghost_page[0]],
+                 [m for _, m in pages] + [ghost_page[1]])
     field_logits, ghost_logit = lg[:-1], float(lg[-1])
 
     order = np.sort(field_logits)[::-1]
@@ -194,9 +234,27 @@ def score_entry(con, keyword: str, country="us"):
     q = blob["meta"]["logit_q"]
     gm = torch.from_numpy(sm.transform(features.vectorize([ghost_feat])[0]))
     gf = torch.from_numpy(sf.transform(features.vectorize([ghost_feat])[1]))
+    gs, gk = _pages(ss, [ghost_page[0]], [ghost_page[1]])
+
+    # Second pass, for the downloads question only.
+    #
+    # "How many would I get" is really "how many would I get AT THAT RANK", and
+    # the rank was not known when the field features were first built. Every app
+    # already in the SERP is scored against its own rank, so scoring the ghost
+    # against no rank at all was the one place train and serve disagreed. The
+    # rank head is NOT re-run on these: it answered already, and feeding its own
+    # answer back to it would be circular.
+    entry_rank = 1 + int((field_logits > ghost_logit).sum())
+    ranked_feat = _feat_for(ghost, keyword, rows, kv, featured, vecs, sg, split,
+                            at_rank=entry_rank)
+    ranked_page = _page_for(ghost, keyword, rows, kv, vecs, split, at_rank=entry_rank)
+    rm = torch.from_numpy(sm.transform(features.vectorize([ranked_feat])[0]))
+    rf = torch.from_numpy(sf.transform(features.vectorize([ranked_feat])[1]))
+    rs, rk = _pages(ss, [ranked_page[0]], [ranked_page[1]])
+    entry = torch.tensor([(entry_rank - 1) / 10.0], dtype=torch.float32)
     with torch.no_grad():
-        v_mean, v_std = model.velocity(gm, gf)
-        agree = float(model.agreement(gm, gf))
+        v_mean, v_std = model.velocity(rm, rf, rs, rk, entry)
+        agree = float(model.agreement(gm, gf, gs, gk))
     # Confidence is agreement TIMES evidence. Ensemble agreement alone reads
     # 1.00 on a model fitted to four keywords, because seven members bootstrapped
     # from the same handful of rows converge on the same answer while knowing
@@ -221,7 +279,7 @@ def score_entry(con, keyword: str, country="us"):
     lo = undo(float(v_mean) - spread)
     hi = undo(float(v_mean) + spread)
     return {
-        "entry_rank": 1 + int((field_logits > ghost_logit).sum()),
+        "entry_rank": entry_rank,
         "downloads": {
             "per_year": per_year, "per_month": per_year / 12.0,
             "per_day": per_year / 365.0,

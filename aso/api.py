@@ -546,8 +546,13 @@ def _write_progress() -> None:
                  f"updated  {db.now()}"]
         if _job.get("result"):
             r = _job["result"]
+            dl = r.get("downloads") or {}
+            tl = r.get("train_loss") or {}
             lines += [f"version  {r.get('version')}",
                       f"auc      {r.get('golden_auc', 0):.3f}",
+                      f"loss     {tl.get('mean') if tl.get('mean') is None else round(tl['mean'], 4)}",
+                      f"dl_error {dl.get('factor_p50')}x typical, "
+                      f"{dl.get('factor_p90')}x p90 over {dl.get('n', 0)} labels",
                       f"promoted {r.get('promoted')}"]
         if _job.get("error"):
             lines.append(f"error    {_job['error']}")
@@ -574,7 +579,13 @@ def _run_training(epochs: int) -> None:
                             "rows": (meta or {}).get("n_rows"),
                             "keywords": (meta or {}).get("n_keywords"),
                             "golden_auc": (meta or {}).get("golden_auc"),
-                            "golden_ece": (meta or {}).get("golden_ece")})
+                            "golden_ece": (meta or {}).get("golden_ece"),
+                            # The rank score alone hid a downloads head that
+                            # moved by multiples between runs, so both heads
+                            # report or the panel is only half the picture.
+                            "train_loss": (meta or {}).get("train_loss"),
+                            "downloads": (meta or {}).get("downloads"),
+                            "labelled_rows": (meta or {}).get("labelled_rows")})
         _state["model"] = active
         _job.update(phase="done", step=_job.get("steps", 0))
     except Exception as e:                                # noqa: BLE001
@@ -604,6 +615,43 @@ def train(epochs: int = 400):
             "poll": "GET /train"}
 
 
+@app.post("/train/activate", dependencies=[Depends(auth)],
+          summary="serve a particular checkpoint")
+def activate(version: str):
+    """Put a chosen checkpoint back in front, overriding the promotion gate.
+
+    The gate decides what a RUN promotes, which is the right default: it stops a
+    worse model taking over by accident. It is the wrong last word, because the
+    held-out AUC scores where apps land and says nothing about whether the
+    downloads answer got better, so a run can be held back for a rounding
+    difference on one score while being the one you want on the other.
+
+    Loading it first is the whole safety of this. A registry row is only a path,
+    and pointing the active flag at a checkpoint this machine cannot read does
+    not fail loudly - serving quietly falls through to the shipped model, or to
+    random weights, and every answer afterwards looks normal and is not.
+    """
+    from . import train as tr
+
+    with session() as con:
+        row = con.execute("SELECT version, path FROM registry WHERE version=%s",
+                          (version,)).fetchone()
+        if row is None:
+            raise HTTPException(404, {"error": "no such checkpoint",
+                                      "detail": f"{version!r} is not in the registry"})
+        if tr._usable(row["path"]) is None:
+            raise HTTPException(409, {
+                "error": "checkpoint cannot be loaded",
+                "detail": f"{version} is missing, or was trained on a different "
+                          f"feature set and can no longer be served. It stays in "
+                          f"the list for the record; retrain to get a current one."})
+        with con.transaction():
+            con.execute("UPDATE registry SET active=0")
+            con.execute("UPDATE registry SET active=1 WHERE version=%s", (version,))
+        _state["model"] = tr.load_active(con)[2]
+    return {"serving": _state["model"], "detail": f"{version} is now active"}
+
+
 @app.get("/train", dependencies=[Depends(auth)], summary="training progress")
 def train_status():
     out = {k: v for k, v in _job.items()}
@@ -611,6 +659,16 @@ def train_status():
         end = _job["finished"] or time.time()
         out["elapsed_seconds"] = round(end - _job["started"], 1)
     out["serving"] = _state["model"]
+    # Every checkpoint, newest first, with what its run scored.
+    #
+    # A single run's numbers say nothing on their own: the point of recording a
+    # training loss is comparing it with the last one, and until this was here
+    # the only way to tell whether a retrain helped was to re-read a prediction
+    # and guess.
+    with session() as con:
+        out["runs"] = [dict(r) for r in con.execute(
+            "SELECT version, created_at, n_rows, golden_auc, golden_ece, "
+            "metrics, active FROM registry ORDER BY created_at DESC LIMIT 20")]
     return out
 
 
