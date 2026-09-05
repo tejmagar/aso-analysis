@@ -503,6 +503,78 @@ def expand(body: Query):
                                ttl_hours=0 if body.no_cache else 24.0)
 
 
+class Refetch(BaseModel):
+    keywords: list[str] = Field(default_factory=list)
+    train_after: bool = False
+
+
+@app.get("/keywords", dependencies=[Depends(auth)],
+         summary="every keyword on file and when it was last fetched")
+def keywords(country: str = "us"):
+    with session() as con:
+        rows = con.execute(
+            """SELECT o.keyword,
+                      MAX(o.observed_at) AS last_seen,
+                      COUNT(DISTINCT o.pkg) AS apps
+                 FROM observations o
+                WHERE o.country = %s AND o.position IS NOT NULL
+                GROUP BY o.keyword ORDER BY MAX(o.observed_at)""",
+            (country,)).fetchall()
+    return {"keywords": [dict(r) for r in rows]}
+
+
+@app.get("/refetch", dependencies=[Depends(auth)], summary="refetch progress")
+def refetch_status():
+    return dict(_refetch)
+
+
+@app.post("/refetch", dependencies=[Depends(auth)],
+          summary="fetch these keywords' pages again, then optionally retrain")
+def refetch(body: Refetch):
+    """Queue pages to be fetched again, in the background.
+
+    Deliberately one keyword at a time. The point of refetching is to have
+    current pages before training, and doing it in parallel would take every
+    slot the gate has and leave anyone analysing a keyword waiting behind a
+    maintenance job they did not ask for.
+    """
+    import threading
+
+    if _refetch.get("state") == "running":
+        raise HTTPException(409, {"error": "busy",
+                                  "detail": "a refetch is already running"})
+    words = [" ".join(k.strip().lower().split()) for k in body.keywords if k.strip()]
+    if not words:
+        raise HTTPException(400, {"error": "empty", "detail": "no keywords given"})
+
+    _refetch.update(state="running", done=0, total=len(words), keyword=None,
+                    started=time.time(), finished=None, failed=0,
+                    train_after=body.train_after, error=None, trained=None)
+
+    def work():
+        from . import scrape
+        for kw in words:
+            _refetch["keyword"] = kw
+            try:
+                with _gate.slot(), session() as con:
+                    scrape.scrape_keyword(con, kw, verbose=False)
+            except Exception as e:                       # noqa: BLE001
+                _refetch["failed"] += 1
+                _refetch["error"] = f"{kw}: {e}"
+            _refetch["done"] += 1
+        _refetch["keyword"] = None
+        if body.train_after:
+            # Inline rather than spawned: the point of the flag is to train on
+            # what was just fetched, so it has to wait for the fetching.
+            _refetch["state"] = "training"
+            _run_training(400)
+            _refetch["trained"] = _job.get("result")
+        _refetch.update(state="done", finished=time.time())
+
+    threading.Thread(target=work, daemon=True).start()
+    return dict(_refetch)
+
+
 @app.post("/search", dependencies=[Depends(auth)])
 def search(body: Query):
     from . import play
