@@ -598,14 +598,22 @@ def test_end_to_end():
     # The correction must SURVIVE a retrain. Retiring the residual without
     # teaching the weights would silently throw every correction away.
     corrected_rank = after["predicted_rank"]
-    train.train(con, k=5, epochs=200, verbose=False)
+    _, _, held_back = train.train(con, k=5, epochs=200, verbose=False)
     check("a correction becomes a permanent observation",
           db.scalar(con, "SELECT COUNT(*) FROM observations WHERE source='review'") == 1)
     live = db.scalar(con, "SELECT COUNT(*) FROM residuals WHERE retired_at IS NULL")
     check("a residual the model has not learned is KEPT, never silently dropped",
           live in (0, 1), f"{live} still live")
-    check("queued corrections are marked absorbed",
-          db.scalar(con, "SELECT COUNT(*) FROM corrections WHERE status='queued'") == 0)
+    # Absorbed IF AND ONLY IF the run was promoted. A correction is absorbed by
+    # the weights that are actually serving, so clearing it after a run the gate
+    # held back would throw the correction away while the model still answers
+    # the old way. This used to assert promotion outright, which passed only for
+    # as long as every retrain happened to beat the one before it.
+    queued = db.scalar(con, "SELECT COUNT(*) FROM corrections WHERE status='queued'")
+    check("queued corrections are absorbed exactly when the run is promoted",
+          queued == (1 if held_back else 0),
+          f'{queued} queued after a run that was '
+          f'{"held back" if held_back else "promoted"}')
     survived = predict.score(con, weak, kw, record=False)
     check("the correction survives a retrain either way",
           survived["predicted_rank"] <= corrected_rank + 2,

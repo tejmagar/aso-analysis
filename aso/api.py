@@ -652,6 +652,44 @@ def activate(version: str):
     return {"serving": _state["model"], "detail": f"{version} is now active"}
 
 
+@app.delete("/train/checkpoint", dependencies=[Depends(auth)],
+            summary="delete a checkpoint")
+def delete_checkpoint(version: str):
+    """Remove a checkpoint: its registry row and the file it points at.
+
+    The active one is refused. Deleting what is serving would leave the registry
+    with no answer, and serving would quietly fall through to the shipped model
+    or to random weights while every reply still looked normal - which is the
+    failure this whole surface exists to make visible.
+
+    Checkpoints that can no longer be loaded ARE deletable, and are the reason
+    this exists: a feature-set change strands every earlier version, and a list
+    of rows that can never serve again is just noise over the ones that can.
+    """
+    import os
+
+    with session() as con:
+        row = con.execute("SELECT version, path, active FROM registry WHERE version=%s",
+                          (version,)).fetchone()
+        if row is None:
+            raise HTTPException(404, {"error": "no such checkpoint",
+                                      "detail": f"{version!r} is not in the registry"})
+        if row["active"]:
+            raise HTTPException(409, {
+                "error": "that one is serving",
+                "detail": f"{version} is active. Make another checkpoint active "
+                          f"first, or train a new one."})
+        # File first, row second. The other order can lose the path and strand
+        # the file with nothing referring to it.
+        try:
+            os.remove(row["path"])
+            removed = True
+        except OSError:
+            removed = False           # already gone, or written on another host
+        con.execute("DELETE FROM registry WHERE version=%s", (version,))
+    return {"deleted": version, "file_removed": removed}
+
+
 @app.get("/train", dependencies=[Depends(auth)], summary="training progress")
 def train_status():
     out = {k: v for k, v in _job.items()}
