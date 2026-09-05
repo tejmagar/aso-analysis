@@ -39,12 +39,30 @@ _state = {"started": time.time(), "requests": 0, "model": None,
 _limits = {"timeout": float(config.get("server_timeout", 180))}
 
 
+# How long a request waits for a slot before giving up. Long enough to sit
+# through one cold keyword ahead of it, short enough that a caller is not held
+# past its own timeout.
+QUEUE_WAIT = float(os.environ.get("ASO_QUEUE_WAIT", 90))
+
+
 class Gate:
-    """Admission limit that can be retuned while requests are in flight."""
+    """Admission control for one egress, with a queue rather than a door.
+
+    It used to refuse the moment it was full, which was defensible when every
+    request shared one limit of four. It is not once each proxy has its own
+    limit of two: a second request from the same person would be turned away
+    while their proxy sat idle a second later. So a caller waits, and only gives
+    up if the wait itself becomes the problem.
+
+    This is a semaphore in one process, deliberately. It is exact, there is no
+    network hop to reason about, and nothing else to run. Redis earns its place
+    when several processes must share a limit; the interface here is small
+    enough that moving it there later touches this class and nothing else.
+    """
 
     def __init__(self, limit: int):
         self._cv = threading.Condition()
-        self._limit, self._held = limit, 0
+        self._limit, self._held, self._waiting = limit, 0, 0
 
     @property
     def limit(self) -> int:
@@ -54,22 +72,36 @@ class Gate:
     def held(self) -> int:
         return self._held
 
+    @property
+    def waiting(self) -> int:
+        return self._waiting
+
     def resize(self, limit: int) -> int:
         with self._cv:
             self._limit = max(1, min(int(limit), HARD_MAX))
-            self._cv.notify_all()
+            self._cv.notify_all()          # a raised limit should admit at once
         return self._limit
 
     @contextmanager
-    def slot(self):
+    def slot(self, wait: float = QUEUE_WAIT):
+        deadline = time.monotonic() + wait
         with self._cv:
-            if self._held >= self._limit:
-                raise HTTPException(
-                    503, {"error": "server busy",
-                          "detail": f"{self._limit} requests already running; a "
-                                    f"cold keyword takes ~40s to scrape",
-                          "in_flight": self._held,
-                          "retry_after_seconds": 30})
+            while self._held >= self._limit:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise HTTPException(
+                        503, {"error": "server busy",
+                              "detail": f"{self._limit} already running and the "
+                                        f"queue did not clear in {wait:.0f}s; a "
+                                        f"cold keyword takes ~40s to scrape",
+                              "in_flight": self._held,
+                              "waiting": self._waiting,
+                              "retry_after_seconds": 30})
+                self._waiting += 1
+                try:
+                    self._cv.wait(left)
+                finally:
+                    self._waiting -= 1
             self._held += 1
         try:
             yield
@@ -79,7 +111,28 @@ class Gate:
                 self._cv.notify()
 
 
-_gate = Gate(int(config.get("server_max_concurrent", 4)))
+# One gate per egress, because the scarce thing is the address Play sees rather
+# than this machine. Work leaving through a user's own proxy is not competing
+# with the shared address and must not queue behind it; two users who configure
+# the same proxy do share a gate, because Play still sees one IP.
+_gates: dict[str, Gate] = {}
+_gates_lock = threading.Lock()
+
+
+def gate_for(egress: str | None = None, limit: int | None = None) -> Gate:
+    """The queue for one egress, created the first time it is asked for."""
+    key = egress or "shared"
+    with _gates_lock:
+        gate = _gates.get(key)
+        if gate is None:
+            gate = _gates[key] = Gate(limit or int(config.get("server_max_concurrent", 4)))
+        elif limit and limit != gate.limit:
+            gate.resize(limit)             # its owner changed their setting
+        return gate
+
+
+# The shared address, which is what everyone without a proxy of their own uses.
+_gate = gate_for()
 
 if not API_TOKEN:
     raise SystemExit(
@@ -114,6 +167,23 @@ def auth(authorization: str = Header(default=""),
 
 
 @contextmanager
+def _egress(body):
+    """Queue for the right address, and fetch through it.
+
+    Two things at once on purpose: the gate a request waits in and the address
+    it leaves from have to be the same decision, or a request could queue on the
+    shared limit and then go out through a proxy, which is the isolation this
+    exists to provide, undone.
+    """
+    from . import egress as eg
+
+    proxy = getattr(body, "proxy", None) or None
+    gate = gate_for(eg.key(proxy), getattr(body, "proxy_concurrency", None))
+    with gate.slot(), eg.through(proxy):
+        yield
+
+
+@contextmanager
 def session():
     """A connection held only as long as it is used, never across network I/O."""
     con = db.connect()
@@ -129,6 +199,11 @@ class Analyze(BaseModel):
     pkg: str | None = Field(None, description="package name or Play Store URL")
     country: str | None = None
     learn: bool = Field(False, description="train on this keyword before answering")
+    proxy: str | None = Field(
+        None, description="leave through this http(s) proxy instead of the server's "
+                          "own address; its queue is separate from the shared one")
+    proxy_concurrency: int | None = Field(
+        None, ge=1, le=32, description="how many at once through that proxy")
     refresh: bool = Field(False, description="fetch the page again even if it is stored")
     max_age_days: float | None = Field(
         None, description="re-fetch when the stored page is older than this")
@@ -274,7 +349,7 @@ def analyze(body: Analyze):
 
 
 def _analyze(body, run, recommend):
-    with _gate.slot(), session() as con:
+    with _egress(body), session() as con:
         o = run(con, body.keyword, country=body.country or config.get("country", "us"),
                 pkg=body.pkg, verbose=False, learn=body.learn,
                 refresh=body.refresh, max_age_days=body.max_age_days)
@@ -306,7 +381,7 @@ def analyze_stream(body: Analyze):
 
     def work():
         try:
-            with _gate.slot(), session() as con:
+            with _egress(body), session() as con:
                 o = run(con, body.keyword,
                         country=body.country or config.get("country", "us"),
                         pkg=body.pkg, verbose=False, learn=body.learn,
@@ -607,7 +682,8 @@ def publisher(developer: str):
 @app.on_event("startup")
 def _warm():
     """Pay the model load once, at startup, where it is visible in the logs."""
-    from . import embed, train
+    from . import egress, embed, train
+    egress.install()
     t0 = time.time()
     embed.encoder()
     with session() as con:
