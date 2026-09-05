@@ -28,6 +28,35 @@ from aso.scrape import organic_positions, parse_date, parse_int  # noqa: E402
 FAILED = []
 
 
+def _refuse_production() -> None:
+    """Refuse to run against a database that is not obviously a test one.
+
+    This suite deletes the model registry and writes synthetic keywords, which
+    is fine against a scratch database and not fine anywhere else. Pointed at
+    the live one it wiped 73 model records and left 293 fixture rows in the
+    training set, and nothing complained, because every one of those writes is
+    what the tests are supposed to do.
+
+    The check is on the name: a database called `aso` is the real one. Set
+    ASO_PG_DSN to something ending in _test to run these.
+    """
+    import os
+    import sys as _s
+
+    dsn = os.environ.get("ASO_PG_DSN", "")
+    if not dsn:
+        return                                  # no database: the caller finds out
+    name = dsn.rsplit("/", 1)[-1].split("?")[0]
+    if name.endswith("_test") or name.startswith("test"):
+        return
+    print(f"\n  refusing to run against the database {name!r}.\n"
+          f"  These tests delete the model registry and insert synthetic\n"
+          f"  keywords. Point ASO_PG_DSN at a scratch database:\n\n"
+          f"    createdb aso_test\n"
+          f"    ASO_PG_DSN=postgresql://…/aso_test python tests/test_pipeline.py\n")
+    _s.exit(2)
+
+
 def check(name, cond, detail=""):
     print(f"  {'PASS' if cond else 'FAIL'}  {name}{'  ' + detail if detail else ''}")
     if not cond:
@@ -572,6 +601,7 @@ def test_end_to_end():
 
 def main():
     print(f"\ntest db: {_TMP}\n")
+    _refuse_production()
     for fn in [test_no_undefined_names, test_promoted_cards_excluded, test_parsers,
                test_field_is_leave_one_out, test_newcomers_signal_penetrability,
                test_intent_and_featured_card, test_intent_group_is_the_competition, test_no_hand_tuned_scoring_remains,
