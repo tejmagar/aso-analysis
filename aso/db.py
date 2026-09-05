@@ -229,6 +229,30 @@ def measured_growth(con, pkgs: list[str]) -> dict[str, float]:
     return out
 
 
+def keyword_breadth(con, pkgs: list[str]) -> dict[str, int]:
+    """How many different phrases each app is reachable through, in what we hold.
+
+    The relationship between a query and an app is one-way. "Falling blocks
+    game" surfaces Tetris; "tetris" never surfaces the falling-blocks clones. So
+    ranking on a phrase means two different things depending on which side of
+    that you are on - the app that owns the concept is reachable many ways, and
+    the ones renamed to avoid its trademark are reachable only through the
+    generic phrase somebody else's brand made valuable.
+
+    A lower bound, and honestly so: it counts phrases WE have scraped, so an app
+    is never credited for reach we have not looked for. That makes it noisy
+    rather than wrong, and it moves the right way as the corpus grows.
+    """
+    if not pkgs:
+        return {}
+    rows = con.execute(
+        """SELECT pkg, COUNT(DISTINCT keyword)::int AS n
+             FROM observations
+            WHERE pkg = ANY(%s) AND position IS NOT NULL
+            GROUP BY pkg""", (list(pkgs),)).fetchall()
+    return {r["pkg"]: r["n"] for r in rows}
+
+
 def _days_between(a: str, b: str) -> float:
     from datetime import datetime
     try:
@@ -253,10 +277,12 @@ def ranked_field(con, keyword: str, country="us") -> list[dict]:
     `position` stays the raw observation; `slot` is the consistent one.
     """
     rows = [dict(r) for r in latest_observations(con, country, keyword)]
-    return _slot(rows, measured_growth(con, [r["pkg"] for r in rows]))
+    pkgs = [r["pkg"] for r in rows]
+    return _slot(rows, measured_growth(con, pkgs), keyword_breadth(con, pkgs))
 
 
-def _slot(rows: list[dict], growth: dict[str, float]) -> list[dict]:
+def _slot(rows: list[dict], growth: dict[str, float],
+          breadth: dict[str, int] | None = None) -> list[dict]:
     """Shared body of the two readers above and below: order, then dense slots."""
     rows.sort(key=lambda r: (r["position"],
                              0 if r.get("source") == "review" else 1,
@@ -267,6 +293,7 @@ def _slot(rows: list[dict], growth: dict[str, float]) -> list[dict]:
         # Absent when the app has only ever been seen once, which is different
         # from measured at zero and has to stay distinguishable downstream.
         r["measured_per_day"] = growth.get(r["pkg"])
+        r["keyword_breadth"] = (breadth or {}).get(r["pkg"], 0)
     return rows
 
 
@@ -280,9 +307,9 @@ def ranked_fields(con, country="us") -> dict[str, list[dict]]:
     by_kw: dict[str, list[dict]] = defaultdict(list)
     for r in latest_observations(con, country):
         by_kw[r["keyword"]].append(dict(r))
-    growth = measured_growth(
-        con, list({r["pkg"] for rows in by_kw.values() for r in rows}))
-    return {kw: _slot(rows, growth) for kw, rows in by_kw.items()}
+    pkgs = list({r["pkg"] for rows in by_kw.values() for r in rows})
+    growth, breadth = measured_growth(con, pkgs), keyword_breadth(con, pkgs)
+    return {kw: _slot(rows, growth, breadth) for kw, rows in by_kw.items()}
 
 
 @contextmanager

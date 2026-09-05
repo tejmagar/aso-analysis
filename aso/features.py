@@ -202,6 +202,18 @@ REGISTRY: list[Feat] = [
     Feat("inorganic_p50", "free", "the same at the middle of the page"),
     Feat("leader_inorganic", "free",
          "how much of the leader's rate its own age does not account for"),
+    Feat("leader_breadth", "free",
+         "how many phrases the app holding the top is reachable through"),
+    Feat("breadth_gap", "free",
+         "how much wider the leader's reach is than the rest of the page's"),
+    # The newest app here, and what it has earned.
+    #
+    # The single strongest piece of evidence about what entering pays, because
+    # it is the only app on the page that started from nothing recently enough
+    # for its number to still describe the market as it stands. Everything else
+    # is a rate averaged over years that are gone.
+    Feat("newest_rate", "dec", "what the most recently published app here earns"),
+    Feat("newest_rank", "free", "where that app sits on the page"),
     Feat("field_staleness_p50", "free", "median days since the field last updated"),
     Feat("field_age_spread",    "free", "p90 minus p10 age: a multi-cohort field is a ladder"),
     Feat("field_age_known",     "free", "fraction of the field whose release date we actually have"),
@@ -397,6 +409,10 @@ def extract(app: dict, keyword: str, field: dict,
         "inorganic_p90": float(field.get("inorganic_p90") or 0.0),
         "inorganic_p50": float(field.get("inorganic_p50") or 0.0),
         "leader_inorganic": float(field.get("leader_inorganic") or 0.0),
+        "leader_breadth": math.log1p(field.get("leader_breadth") or 0),
+        "breadth_gap": float(field.get("breadth_gap") or 0.0),
+        "newest_rate": math.log1p(field.get("newest_rate") or 0.0),
+        "newest_rank": float(field.get("newest_rank") or 0),
         "field_measured_evidence": float(field.get("measured_count") or 0),
         # Paired with the rate, because a median over one app is a number and not
         # a measurement, and the model should be able to tell the difference.
@@ -564,7 +580,8 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
                 "first_match_rank": 0, "match_starts_below": 0,
                 "band_rate": 0.0, "band_recent_rate": 0.0, "band_evidence": 0,
                 "below_rate": 0.0, "inorganic_p90": 0.0, "inorganic_p50": 0.0,
-                "leader_inorganic": 0.0,
+                "leader_inorganic": 0.0, "leader_breadth": 0, "breadth_gap": 0.0,
+                "newest_rate": 0.0, "newest_rank": 0,
                 "staleness_p50": 0, "newest_entrant_age": 0, "velocity_p50": 0,
                 "age_spread": 0, "age_known_frac": 0, "relevance_p50": 0,
                 "relevant_count": 0, "installs_p50_relevant": 0,
@@ -736,6 +753,7 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
         "intent_recent_neighbour_rate": recent_neighbour,
         "intent_recent_neighbour_gap": recent_gap,
         **_inorganic_page(ranked),
+        **_reach_and_newest(ranked),
         "band_rate": band["all"],
         "band_recent_rate": band["recent"],
         "band_evidence": len(near_rows),
@@ -750,6 +768,24 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
         "exact_match_count": int(sum(exact_match(r.get("title") or "", keyword)
                                      for r in ranked)),
         **_leader(ranked, keyword, rel, inst),
+    }
+
+
+def _reach_and_newest(ranked) -> dict:
+    """Who is reachable how many ways, and what the newest arrival earns."""
+    if not ranked:
+        return {"leader_breadth": 0, "breadth_gap": 0.0,
+                "newest_rate": 0.0, "newest_rank": 0}
+    reach = [r.get("keyword_breadth") or 0 for r in ranked]
+    rest = reach[1:] or reach
+    fresh = [r for r in ranked if _days_since(r.get("released_at")) > 0]
+    newest = min(fresh, key=lambda r: _days_since(r.get("released_at"))) if fresh else None
+    return {
+        "leader_breadth": reach[0],
+        # In log units, so "twice as reachable" and "ten times" differ.
+        "breadth_gap": math.log1p(reach[0]) - math.log1p(float(np.median(rest))),
+        "newest_rate": _rate_of(newest) if newest else 0.0,
+        "newest_rank": newest["position"] if newest else 0,
     }
 
 
@@ -911,7 +947,11 @@ PAGE_FEATS = [
     # 0 to 1: how much of this app's rate its age does not account for. High is
     # the shape paid installs leave, and also the shape a hit leaves, which is
     # why it is a measurement and not a verdict.
-    "inorganic"
+    "inorganic",
+    # How many different phrases this app is reachable through. The app that
+    # owns a concept is reachable many ways; one renamed to avoid a trademark
+    # is reachable only through the generic phrase.
+    "breadth"
     "title_exact",       # carries the phrase in its title
     "staleness",         # years since it last shipped an update
     "featured",          # Play's promoted card
@@ -961,6 +1001,7 @@ def page_matrix(rows: list[dict], keyword: str, kw_vec=None,
             _cos(_vec_for(r, app_vecs), top_vec),
             (r["position"] - top_rank) / 10.0,
             _inorganic(r, ranked),
+            math.log1p(r.get("keyword_breadth") or 0),
             1.0 if kw in (r.get("title") or "").lower() else 0.0,
             min(_days_since(r.get("updated_at")) / 365.0, 10.0),
             float(r.get("featured") or 0),
