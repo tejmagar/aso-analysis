@@ -561,17 +561,22 @@ def _write_progress() -> None:
         pass                       # progress reporting must never fail a run
 
 
-def _run_training(epochs: int) -> None:
+def _run_training(epochs: int, warm_start: bool = False) -> None:
     from . import train as tr
 
     def progress(phase, done, total, note):
+        # The only place a run is interruptible. Raising here unwinds out of the
+        # fitting loop before anything is saved.
+        if _job.get("cancel"):
+            raise tr.Cancelled("cancelled")
         _job.update(phase=phase, step=done, steps=total, note=note)
         _write_progress()
 
     try:
         with session() as con:
             version, meta, gated = tr.train(con, epochs=epochs, verbose=False,
-                                            progress=progress)
+                                            progress=progress,
+                                            warm_start=warm_start)
             active = tr.load_active(con)[2]
         _job.update(state="done", finished=time.time(),
                     result={"version": version, "promoted": not gated,
@@ -585,9 +590,19 @@ def _run_training(epochs: int) -> None:
                             # report or the panel is only half the picture.
                             "train_loss": (meta or {}).get("train_loss"),
                             "downloads": (meta or {}).get("downloads"),
-                            "labelled_rows": (meta or {}).get("labelled_rows")})
+                            "labelled_rows": (meta or {}).get("labelled_rows"),
+                            # Asked for versus what happened: a warm start falls
+                            # back to scratch when no loadable parent matches,
+                            # and saying so beats a label that quietly lies.
+                            "init": (meta or {}).get("init"),
+                            "parent": (meta or {}).get("parent")})
         _state["model"] = active
         _job.update(phase="done", step=_job.get("steps", 0))
+    except tr.Cancelled:
+        # Not a failure: nothing was written, and the model that was serving
+        # before is still serving.
+        _job.update(state="cancelled", finished=time.time(), cancel=False,
+                    phase="cancelled", note="stopped before anything was saved")
     except Exception as e:                                # noqa: BLE001
         _job.update(state="failed", finished=time.time(),
                     error=f"{type(e).__name__}: {e}")
@@ -597,7 +612,7 @@ def _run_training(epochs: int) -> None:
 
 @app.post("/train", dependencies=[Depends(auth)],
           summary="start a training run in the background")
-def train(epochs: int = 400):
+def train(epochs: int = 400, warm_start: bool = False):
     with _job_lock:
         if _job["state"] == "running":
             raise HTTPException(409, {
@@ -605,12 +620,13 @@ def train(epochs: int = 400):
                 "detail": "one run at a time; poll GET /train for progress",
                 "started_seconds_ago": round(time.time() - (_job["started"] or 0), 1)})
         _job.update(state="running", started=time.time(), finished=None,
-                    result=None, error=None, epochs=epochs,
+                    result=None, error=None, epochs=epochs, cancel=False,
+                    warm_start=warm_start,
                     phase="starting", step=0, steps=0, note="")
     _write_progress()
-    threading.Thread(target=_run_training, args=(epochs,), daemon=True,
+    threading.Thread(target=_run_training, args=(epochs, warm_start), daemon=True,
                      name="aso-train").start()
-    return {"state": "running", "epochs": epochs,
+    return {"state": "running", "epochs": epochs, "warm_start": warm_start,
             "detail": "training started; analysis continues on the current model",
             "poll": "GET /train"}
 
@@ -688,6 +704,28 @@ def delete_checkpoint(version: str):
             removed = False           # already gone, or written on another host
         con.execute("DELETE FROM registry WHERE version=%s", (version,))
     return {"deleted": version, "file_removed": removed}
+
+
+@app.post("/train/cancel", dependencies=[Depends(auth)],
+          summary="stop the training run in progress")
+def cancel_training():
+    """Ask the run to stop at its next checkpoint.
+
+    Cooperative rather than immediate: the thread is asked, not killed, so it
+    unwinds cleanly instead of leaving torch part way through a step. It stops
+    at the next phase or fiftieth epoch, so a long dataset build can take a
+    moment to notice.
+
+    Nothing was written yet, so there is nothing to undo and whatever was
+    serving before still is.
+    """
+    with _job_lock:
+        if _job["state"] != "running":
+            raise HTTPException(409, {
+                "error": "nothing is running",
+                "detail": f"the training job is {_job['state']}"})
+        _job["cancel"] = True
+    return {"detail": "stopping at the next checkpoint"}
 
 
 @app.delete("/train/checkpoints", dependencies=[Depends(auth)],

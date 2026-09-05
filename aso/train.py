@@ -36,6 +36,19 @@ MIN_KEYWORDS = 25
 MIN_AUC = 0.55        # only enforced once the split is measurable
 
 
+class Cancelled(Exception):
+    """Raised out of the progress callback to stop a run.
+
+    Cooperative, because a fitting thread cannot be killed from outside without
+    leaving torch mid-step. The callback is already invoked at every phase and
+    every fiftieth epoch, so it is the one place the run reliably passes through
+    - checking there costs nothing and needs no flag threaded down the stack.
+
+    Nothing is written until the run finishes, so an abort leaves no checkpoint
+    file, no registry row, and no half-promoted model.
+    """
+
+
 def _fit_member(model, xm, xf, y, v, w, xs=None, xb=None, mask=None, rank=None,
                 epochs=400, lr=0.05, seed=0, on_epoch=None):
     """Two heads, one trunk. The rank task is the objective; the downloads task
@@ -63,7 +76,7 @@ def _fit_member(model, xm, xf, y, v, w, xs=None, xb=None, mask=None, rank=None,
 
 
 def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
-          progress=None):
+          progress=None, warm_start=False):
     """`progress(phase, done, total, note)` is called as the run advances.
 
     Training takes ~45 seconds and is started from a chat where "working on it"
@@ -86,8 +99,25 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
         if verbose:
             print("! only one keyword group: golden split is not meaningful yet")
 
-    sm = features.Scaler().fit(data["xm"][tr])
-    sf = features.Scaler().fit(data["xf"][tr])
+    # Continue from the model that is serving, or start over.
+    #
+    # A warm start keeps the PARENT's scalers rather than refitting them. The
+    # weights were fitted against that scaling, and rescaling the inputs
+    # underneath them is the one change that makes the inherited weights mean
+    # something else - the run would then spend its epochs recovering from the
+    # shift rather than improving on the parent.
+    parent, parent_blob = None, None
+    if warm_start:
+        got = load_active(con, create=False)     # never bootstraps: read only
+        if got[0] is not None:
+            parent, parent_blob = got[2], got[1]
+
+    if parent_blob is not None:
+        sm = features.Scaler.load(parent_blob["scaler_mono"])
+        sf = features.Scaler.load(parent_blob["scaler_free"])
+    else:
+        sm = features.Scaler().fit(data["xm"][tr])
+        sf = features.Scaler().fit(data["xf"][tr])
     XM, XF = sm.transform(data["xm"]), sf.transform(data["xf"])
     # The page rows are scaled per column over the REAL apps only. Fitting over
     # the zero padding too would drag every mean toward zero by however many
@@ -95,7 +125,10 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
     # apps. Padding is re-zeroed after transform so it stays inert.
     XS, XB, MK = data["xs"], data["xs_blind"], data["mask"]
     real = MK[tr].reshape(-1) > 0.5
-    ss = features.Scaler().fit(XS[tr].reshape(-1, XS.shape[-1])[real])
+    if parent_blob is not None and parent_blob.get("scaler_set"):
+        ss = features.Scaler.load(parent_blob["scaler_set"])
+    else:
+        ss = features.Scaler().fit(XS[tr].reshape(-1, XS.shape[-1])[real])
 
     def _scale_pages(A):
         return (ss.transform(A.reshape(-1, A.shape[-1]))
@@ -141,6 +174,21 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
         f"{len(np.unique(data['groups']))} keywords")
     model = Ensemble(XM.shape[1], XF.shape[1], k=k, hidden=hidden,
                      n_app=XS.shape[-1])
+    # Inherit the parent's weights only if its shape matches exactly. A run with
+    # a different member count or hidden width is a different model, and loading
+    # across that quietly would be worse than starting over.
+    lr = 0.05
+    if parent is not None:
+        got = load_active(con, create=False)
+        if got[0] is not None and got[0].cfg == model.cfg:
+            model.load_state_dict(got[0].state_dict())
+            # A fifth of the usual step. At the full rate a fresh optimiser
+            # walks the inherited weights far enough in the first few epochs
+            # that continuing and starting over converge to the same place, and
+            # the distinction the caller asked for stops meaning anything.
+            lr = 0.01
+        else:
+            parent, parent_blob = None, None    # shape changed: this is a fresh fit
     rng = np.random.default_rng(seed)
     idx_tr = np.flatnonzero(tr)
     losses = []
@@ -154,7 +202,7 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
                     xs=torch.from_numpy(XS[boot]), xb=torch.from_numpy(XB[boot]),
                     mask=torch.from_numpy(MK[boot]),
                     rank=torch.from_numpy(data["rank"][boot]),
-                    epochs=epochs, lr=0.05, seed=seed + i,
+                    epochs=epochs, lr=lr, seed=seed + i,
                     on_epoch=lambda e, l, _i=i: say(
                         "fitting", _i, k, f"member {_i + 1} of {k}, epoch {e}")))
 
@@ -219,6 +267,11 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
         "downloads": vel,
         "labelled_rows": int((~np.isnan(data["v"])).sum()),
         "epochs": int(epochs), "seed": int(seed), "members": int(k),
+        # Which of the two runs this was, and what it continued from. Without
+        # it a checkpoint's loss cannot be read: a low one means something
+        # different when it inherited a fitted model than when it did not.
+        "init": "finetuned" if parent else "scratch",
+        "parent": parent, "lr": lr,
     }
 
     # Two independent gates. The relative one stops a regression; the absolute
@@ -246,7 +299,8 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
                                   "downloads": vel,
                                   "labelled_rows": meta["labelled_rows"],
                                   "epochs": epochs, "seed": seed,
-                                  "members": k})))
+                                  "members": k,
+                                  "init": meta["init"], "parent": parent})))
         if not gated:
             con.execute("UPDATE registry SET active=0")
             con.execute("UPDATE registry SET active=1 WHERE version=%s", (version,))
