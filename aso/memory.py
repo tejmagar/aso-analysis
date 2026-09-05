@@ -95,13 +95,13 @@ def write(con, correction_id, keyword, x: np.ndarray, pkg: str | None,
     """
     from .db import now
     compensated = (target_logit - predicted_logit) * (weight + SHRINK) / weight
-    cur = con.execute(
+    row = con.execute(
         "INSERT INTO residuals (ts, correction_id, keyword, pkg, features_json, "
-        "residual, target_logit, weight) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+        "residual, target_logit, weight) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
+        "RETURNING id",
         (now(), correction_id, keyword, pkg, json.dumps([float(v) for v in x]),
-         float(compensated), float(target_logit), float(weight)))
-    con.commit()
-    return cur.lastrowid
+         float(compensated), float(target_logit), float(weight))).fetchone()
+    return row["id"]
 
 
 def active_rows(con, n_features: int | None = None):
