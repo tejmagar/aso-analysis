@@ -406,7 +406,15 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
             dl.update(mae_log=float(np.abs(dm - dt).mean()),
                       factor_p50=float(np.percentile(r, 50)),
                       factor_p90=float(np.percentile(r, 90)),
-                      spread_log_p50=float(np.percentile(dsp, 50)))
+                      spread_log_p50=float(np.percentile(dsp, 50)),
+                      # What this model's disagreement normally looks like, so
+                      # serving can say whether TODAY's spread is ordinary or
+                      # unusual. A raw spread of 0.89 means nothing on its own;
+                      # against this it means "wider than nine pages in ten".
+                      # Measured every run rather than fixed, because a better
+                      # model disagrees less and the scale has to move with it.
+                      spread_q=[float(x) for x in
+                                np.percentile(dsp, np.arange(5, 100, 5))])
 
         # It only gets to answer if it beats the head it replaces, judged on the
         # SAME apps. The two are otherwise scored on different populations - the

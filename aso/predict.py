@@ -205,6 +205,47 @@ def hypothetical_app(keyword: str) -> dict:
     }
 
 
+def _downloads_confidence(blob, spread: float, points, at_rank: int):
+    """How much to trust the downloads figure, and why not.
+
+    The NUMBER comes from one measured thing: how today's disagreement compares
+    with the disagreement this same model showed across the held-out pages of
+    its own training run. A raw spread of 0.89 means nothing on its own; against
+    that distribution it means "wider than nine pages in ten". The yardstick is
+    remeasured every run, so a better model that disagrees less everywhere is
+    not scored against an old scale.
+
+    The REASONS are stated separately and do not touch the number. It is
+    tempting to also multiply the confidence down when the slot sits at the edge
+    of the page - entering at #1 means nothing above you, so every rate being
+    read comes from below, which is extrapolation rather than interpolation. But
+    the size of that penalty would be a figure I picked, and the spread already
+    reflects it: the members are what disagree when the evidence runs out. So
+    the edge is reported as context and left out of the arithmetic until it is
+    measured to add something the spread misses.
+    """
+    why = []
+    q = ((blob.get("meta", {}).get("downloads_model") or {}).get("spread_q"))
+    if not q:
+        return None, why                    # a run that never measured it
+    pct = float(np.searchsorted(np.asarray(q), spread)) / (len(q) + 1)
+    if pct >= 0.75:
+        why.append("the ensemble disagrees more than usual about this page")
+
+    above = sum(1 for _, rank, _ in points if rank < at_rank)
+    if not above:
+        why.append("nothing on the page ranks above this slot, so the rate is "
+                   "extended past the apps we can read rather than taken from "
+                   "between them")
+    elif above == len(points):
+        why.append("nothing on the page ranks below this slot")
+
+    # Evidence, the same term the rank confidence uses: a model fitted on a
+    # handful of keywords agrees with itself while knowing almost nothing.
+    evidence = min(blob["meta"].get("n_keywords", 0) / 25.0, 1.0)
+    return max(0.0, min(1.0, 1.0 - pct)) * evidence, why
+
+
 def score_entry(con, keyword: str, country="us"):
     """Where a well-built new app would land. The model's answer, unmediated."""
     model, blob, version = train.load_active(con)
@@ -298,6 +339,7 @@ def score_entry(con, keyword: str, country="us"):
     # trained on, with the release date as the coordinate rather than an age, so
     # "today" is an ordinary point on the line and not the edge of one.
     answered_by = "head"
+    dl_conf, dl_why = None, []
     dl_states = blob.get("downloads")
     if dl_states:
         today = downloads.stamp(db.date.today().isoformat())
@@ -311,6 +353,8 @@ def score_entry(con, keyword: str, country="us"):
             hi = undo(float(dmean[0]) + ds)
             spread = ds
             answered_by = "page"
+            dl_conf, dl_why = _downloads_confidence(blob, float(dspread[0]),
+                                                    pts, entry_rank)
     return {
         "entry_rank": entry_rank,
         "downloads": {
@@ -318,6 +362,11 @@ def score_entry(con, keyword: str, country="us"):
             "per_day": per_year / 365.0,
             "low_per_year": lo, "high_per_year": hi,
             "answered_by": answered_by,
+            # Downloads gets its OWN confidence. The one below it is the rank
+            # ensemble's agreement, and lending that number to a different
+            # model's answer is how a page nobody can read ends up looking
+            # certain.
+            "confidence": dl_conf, "uncertain_because": dl_why,
         },
         "confidence": conf, "agreement": agree, "evidence": evidence,
         "field_size": len(ranked),
