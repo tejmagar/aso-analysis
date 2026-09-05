@@ -951,12 +951,23 @@ PAGE_FEATS = [
     # How many different phrases this app is reachable through. The app that
     # owns a concept is reachable many ways; one renamed to avoid a trademark
     # is reachable only through the generic phrase.
-    "breadth"
+    "breadth",
     "title_exact",       # carries the phrase in its title
     "staleness",         # years since it last shipped an update
     "featured",          # Play's promoted card
 ]
 MAX_APPS = 12
+
+# Every name distinct, and none of them accidentally glued to the next.
+#
+# A missing comma between two strings in a list is not an error in Python, it is
+# concatenation: the list quietly loses an entry and the only symptom is a
+# shape mismatch thrown much later, from a line that looks fine. This shipped
+# once - "breadth" "title_exact" became one name, and every analysis died with
+# "could not broadcast input array from shape (20,) into shape (19,)".
+assert len(set(PAGE_FEATS)) == len(PAGE_FEATS), "duplicate page feature"
+assert not [n for n in PAGE_FEATS if len(n) > 24], \
+    f"page feature name too long, likely a missing comma: {PAGE_FEATS}"
 
 
 def page_matrix(rows: list[dict], keyword: str, kw_vec=None,
