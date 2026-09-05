@@ -173,6 +173,23 @@ REGISTRY: list[Feat] = [
          "where the highest app carrying the phrase sits, 0 if none does"),
     Feat("match_starts_below", "free",
          "how many ranks separate the top of the page from the first literal match"),
+    # What a SLOT earns, regardless of who is judged to share your meaning.
+    #
+    # The intent features answer "what do apps like mine earn", and they are
+    # only as good as the grouping. On "falling blocks game" the group came out
+    # as the two official Tetris apps - the leader and its sequel, alike by name
+    # and alike to nothing a newcomer could be - so every on-intent rate read
+    # sixteen thousand a day while the page's own median was twenty.
+    #
+    # These ask a question with no judgement in it: what do the apps sitting
+    # where you would sit actually earn. A grouping mistake cannot reach them,
+    # which is the point - they are the floor under an answer that otherwise
+    # rests entirely on getting the meaning right.
+    Feat("band_rate", "dec", "what apps within a couple of ranks of you earn"),
+    Feat("band_recent_rate", "free",
+         "the same, for the ones that launched within the year"),
+    Feat("band_evidence", "free", "how many apps that neighbourhood rate covers"),
+    Feat("below_rate", "dec", "what the apps ranked beneath you earn"),
     Feat("field_staleness_p50", "free", "median days since the field last updated"),
     Feat("field_age_spread",    "free", "p90 minus p10 age: a multi-cohort field is a ladder"),
     Feat("field_age_known",     "free", "fraction of the field whose release date we actually have"),
@@ -361,6 +378,10 @@ def extract(app: dict, keyword: str, field: dict,
         "leader_lead": float(field.get("leader_lead") or 0.0),
         "first_match_rank": float(field.get("first_match_rank") or 0),
         "match_starts_below": float(field.get("match_starts_below") or 0),
+        "band_rate": math.log1p(field.get("band_rate") or 0.0),
+        "band_recent_rate": math.log1p(field.get("band_recent_rate") or 0.0),
+        "band_evidence": float(field.get("band_evidence") or 0),
+        "below_rate": math.log1p(field.get("below_rate") or 0.0),
         "field_measured_evidence": float(field.get("measured_count") or 0),
         # Paired with the rate, because a median over one app is a number and not
         # a measurement, and the model should be able to tell the difference.
@@ -475,6 +496,8 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
                 "intent_recent_neighbour_gap": 0.0,
                 "leader_match": 0.0, "leader_relevance": 0.0, "leader_lead": 0.0,
                 "first_match_rank": 0, "match_starts_below": 0,
+                "band_rate": 0.0, "band_recent_rate": 0.0, "band_evidence": 0,
+                "below_rate": 0.0,
                 "staleness_p50": 0, "newest_entrant_age": 0, "velocity_p50": 0,
                 "age_spread": 0, "age_known_frac": 0, "relevance_p50": 0,
                 "relevant_count": 0, "installs_p50_relevant": 0,
@@ -570,6 +593,19 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
     # started from nothing near your rank, rather than a lifetime average banked
     # by an app that has held its slot since before the phrase existed. The gap
     # is how far away it sits, because the evidence is only as good as it is near.
+    # The neighbourhood: apps sitting where this one would sit. Two ranks either
+    # side, which on a ten-slot window is the part of the page a reader actually
+    # compares against - wider and it is the page again, narrower and one
+    # unusual neighbour is the whole answer.
+    if own_rank:
+        near_rows = [r for r in ranked if abs(r["position"] - own_rank) <= 2
+                     and r.get("position") != own_rank]
+        below_rows = [r for r in ranked if r["position"] > own_rank]
+    else:
+        near_rows, below_rows = [], []
+    band = _rates(near_rows)
+    below = _rates(below_rows)
+
     if own_rank and recent_intent:
         rnear = min(recent_intent, key=lambda r: abs(r["position"] - own_rank))
         recent_neighbour = _rate_of(rnear)
@@ -632,6 +668,10 @@ def compute_field(rows: list[dict], keyword: str, top_n: int = 10,
         "intent_neighbour_age": neighbour_age,
         "intent_recent_neighbour_rate": recent_neighbour,
         "intent_recent_neighbour_gap": recent_gap,
+        "band_rate": band["all"],
+        "band_recent_rate": band["recent"],
+        "band_evidence": len(near_rows),
+        "below_rate": below["all"],
         "newcomer_installs": max((r.get("installs") or 0) for r in recent) if recent else 0,
         "staleness_p50": float(np.percentile(stale, 50)) if stale.size else 0.0,
         "installs_p10": float(np.percentile(inst, 10)),

@@ -87,7 +87,7 @@ PAIR_WEIGHT = 1.0
 
 
 def _fit_member(model, xm, xf, y, v, w, xs=None, xb=None, mask=None, rank=None,
-                pairs=None, epochs=400, lr=0.05, seed=0, on_epoch=None):
+                pairs=None, vw=None, epochs=400, lr=0.05, seed=0, on_epoch=None):
     """Two heads, one trunk, and two things asked of the rank head.
 
     The rank head is scored on whether an app reaches the top N, and its logit
@@ -123,8 +123,18 @@ def _fit_member(model, xm, xf, y, v, w, xs=None, xb=None, mask=None, rank=None,
             # so the ordering term costs an indexing operation and no forward pass.
             loss = loss + PAIR_WEIGHT * F.softplus(-(logit[hi] - logit[lo])).mean()
         if known.any():
-            loss = loss + 0.3 * F.mse_loss(
-                model.velocity(xm, xf, xs, mask, rank)[known], vt[known])
+            # Weighted by how recently the app launched, not counted flat.
+            #
+            # An app that started from nothing four months ago and reached a
+            # thousand installs is evidence about what starting from nothing
+            # gets you now. The same figure from an app that launched sixteen
+            # months ago was earned under whatever demand held then, against
+            # whatever page stood then, and the two were being averaged as if
+            # they said the same thing. The rank task has weighted by recency
+            # since it was written; this one never did.
+            err = (model.velocity(xm, xf, xs, mask, rank)[known] - vt[known]) ** 2
+            loss = loss + 0.3 * ((err * vw[known]).sum() / vw[known].sum()
+                                 if vw is not None else err.mean())
         loss.backward()
         opt.step()
         # Report every 50 epochs rather than every one: the callback writes to
@@ -223,10 +233,17 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
     # what holds rank 3.
     HALF_LIFE = 1.0
     w = np.ones(len(data["y"]), dtype="float32")
+    # The downloads task decays harder than the rank task, and from 1 rather
+    # than from 4. Ranking is about where an app sits, which an established app
+    # still demonstrates; earning is about what starting from nothing pays, and
+    # a year-old figure is a year-old market. Halving yearly means a
+    # three-month-old app counts roughly four times a fifteen-month-old one.
+    vw = np.ones(len(data["y"]), dtype="float32")
     for i, m in enumerate(data["meta"]):
         age = m.get("age_years") or 0.0
         if age > 0:
             w[i] = 1.0 + 3.0 * float(0.5 ** (age / HALF_LIFE))
+            vw[i] = max(float(0.5 ** (age / HALF_LIFE)), 0.05)
         if m["source"] == "review":
             w[i] = max(w[i], 5.0)            # a human confirmed this rank
         elif m["source"] == "owned":
@@ -265,7 +282,7 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
                     xs=torch.from_numpy(XS[boot]), xb=torch.from_numpy(XB[boot]),
                     mask=torch.from_numpy(MK[boot]),
                     rank=torch.from_numpy(data["rank"][boot]),
-                    pairs=pairs,
+                    pairs=pairs, vw=torch.from_numpy(vw[boot]),
                     epochs=epochs, lr=lr, seed=seed + i,
                     on_epoch=lambda e, l, _i=i: say(
                         "fitting", _i, k, f"member {_i + 1} of {k}, epoch {e}")))
