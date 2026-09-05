@@ -182,11 +182,11 @@ def run(con, limit: int | None = None, sleep: float = 0.8,
             # worse, the stub overwrote real metadata if the app was already known.
             detail = None
             try:
-                detail = g.fetch_app_details(t["pkg"])
+                detail = scrape._api().fetch_app_details(t["pkg"])
             except Exception:                            # noqa: BLE001
                 pass
             if detail:
-                db.upsert_app(con, to_app_row(detail, country, lang))
+                db.upsert_app(con, scrape.to_app_row(detail, country))
             else:
                 existing = con.execute("SELECT pkg FROM apps WHERE pkg=%s",
                                        (t["pkg"],)).fetchone()

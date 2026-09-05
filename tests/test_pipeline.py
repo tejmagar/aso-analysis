@@ -369,6 +369,31 @@ def test_no_hand_tuned_scoring_remains():
               if f.name.startswith("sugg_")))
 
 
+def test_no_undefined_names():
+    """Every name the code uses exists.
+
+    This is here because a name that is only referenced inside a function is not
+    checked until that function runs, so `_refetch` reached production undefined
+    and failed the first time an admin pressed the button. The same pass found
+    three more, including one introduced the same day that would have crashed
+    `aso serve` on startup. Import-time checks cannot catch any of them.
+    """
+    import subprocess
+    import sys as _sys
+
+    root = Path(__file__).resolve().parent.parent
+    files = sorted(str(p) for p in (root / "aso").glob("*.py"))
+    out = subprocess.run([_sys.executable, "-m", "pyflakes", *files],
+                         capture_output=True, text=True)
+    if "No module named pyflakes" in out.stderr:
+        check("pyflakes is available to check for undefined names", True,
+              "not installed, skipped")
+        return
+    bad = [l for l in out.stdout.splitlines() if "undefined name" in l]
+    check("no undefined names anywhere in aso/", not bad,
+          bad[0] if bad else f"{len(files)} files clean")
+
+
 def test_model_always_predicts():
     """An untrained network still answers. Refusing until a gate is satisfied
     would mean no prediction on day one and no way to watch it improve."""
@@ -547,7 +572,7 @@ def test_end_to_end():
 
 def main():
     print(f"\ntest db: {_TMP}\n")
-    for fn in [test_promoted_cards_excluded, test_parsers,
+    for fn in [test_no_undefined_names, test_promoted_cards_excluded, test_parsers,
                test_field_is_leave_one_out, test_newcomers_signal_penetrability,
                test_intent_and_featured_card, test_intent_group_is_the_competition, test_no_hand_tuned_scoring_remains,
                test_model_always_predicts, test_downloads_and_confidence_are_learned, test_suggestions_are_real_not_invented,

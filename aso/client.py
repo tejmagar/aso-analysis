@@ -12,7 +12,7 @@ import urllib.error
 import urllib.request
 
 from . import env as _env
-from .server import HOST, PORT
+from .runfile import HOST, PORT
 
 _env.load()
 
@@ -25,7 +25,7 @@ def base() -> str:
     """
     if os.environ.get("ASO_SERVER"):
         return os.environ["ASO_SERVER"]
-    from .server import read_runfile
+    from .runfile import read_runfile
     got = read_runfile()
     if got:
         return f"http://{got['host']}:{got['port']}"

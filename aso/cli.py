@@ -881,7 +881,7 @@ def cmd_serve(a):
 
     import uvicorn
 
-    from . import api, config, server
+    from . import api, config, runfile
 
     if a.max_concurrent:
         api._gate.resize(a.max_concurrent)
@@ -889,7 +889,7 @@ def cmd_serve(a):
         api._limits["timeout"] = a.timeout
 
     explicit = a.port is not None
-    port = a.port if explicit else server.PORT
+    port = a.port if explicit else runfile.PORT
     strict = explicit and not a.auto_port
 
     def free(p):
@@ -908,7 +908,7 @@ def cmd_serve(a):
                 f"  You asked for this port specifically, so it was not moved.\n"
                 f"  aso serve --port {port} --auto-port   move up if busy\n"
                 f"  aso serve                            use the default, "
-                f"{server.PORT}")
+                f"{runfile.PORT}")
         found = next((p for p in range(port + 1, port + 21) if free(p)), None)
         if found is None:
             raise SystemExit(f"no free port between {port + 1} and {port + 20}")
@@ -918,20 +918,20 @@ def cmd_serve(a):
     # No token, no server, wherever it binds. The loopback exemption was wrong
     # in a container: every other service on the same network reaches it, and
     # an unset variable is exactly how a token goes missing.
-    if not API_TOKEN:
+    if not api.API_TOKEN:
         raise SystemExit(
             "refusing to start without ASO_API_TOKEN.\n"
             "  This server scrapes, trains and writes to the database, so a\n"
             "  reachable port hands a stranger write access.\n\n"
             "  Set it in .env:   ASO_API_TOKEN=$(openssl rand -hex 24)")
 
-    server.write_runfile(a.host, port)
+    runfile.write_runfile(a.host, port)
     print(f"  http://{a.host}:{port}   docs at /docs")
     try:
         uvicorn.run(api.app, host=a.host, port=port, log_level="warning",
                     timeout_keep_alive=65)
     finally:
-        server.RUNFILE.unlink(missing_ok=True)
+        runfile.RUNFILE.unlink(missing_ok=True)
 
 
 def cmd_train(a):

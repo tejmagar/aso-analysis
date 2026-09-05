@@ -379,6 +379,12 @@ _job: dict = {"state": "idle", "started": None, "finished": None,
               "phase": None, "step": 0, "steps": 0, "note": ""}
 _job_lock = threading.Lock()
 
+# The refetch queue's state, shaped like _job: a background run the admin page
+# polls rather than a request anyone waits on.
+_refetch: dict = {"state": "idle", "done": 0, "total": 0, "keyword": None,
+                  "failed": 0, "started": None, "finished": None,
+                  "train_after": False, "trained": None, "error": None}
+
 # Progress is mirrored to a file as well as held in memory. The API process can
 # be restarted, and a run started from a chat should still be explicable
 # afterwards rather than vanishing with the process that owned it.
