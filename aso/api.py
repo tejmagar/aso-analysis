@@ -63,6 +63,10 @@ class Gate:
     def __init__(self, limit: int):
         self._cv = threading.Condition()
         self._limit, self._held, self._waiting = limit, 0, 0
+        # Everyone holding a slot or about to ask for one. Not the same as
+        # `held`: a caller that has looked the gate up but not yet acquired is
+        # counted, which is what stops it being swept from under them.
+        self.users = 0
 
     @property
     def limit(self) -> int:
@@ -115,24 +119,84 @@ class Gate:
 # than this machine. Work leaving through a user's own proxy is not competing
 # with the shared address and must not queue behind it; two users who configure
 # the same proxy do share a gate, because Play still sees one IP.
+#
+# Gates appear when an address is first used and disappear when the last caller
+# leaves, so the registry holds only what is in flight rather than one entry per
+# proxy anyone has ever configured.
 _gates: dict[str, Gate] = {}
 _gates_lock = threading.Lock()
 
 
-def gate_for(egress: str | None = None, limit: int | None = None) -> Gate:
-    """The queue for one egress, created the first time it is asked for."""
+def shared_limit() -> int:
+    """What the shared address admits at once."""
+    return int(config.get("server_max_concurrent", 4))
+
+
+def busy() -> dict:
+    """A snapshot of every queue currently alive.
+
+    The shared numbers are reported separately because they are the ones an
+    admin sets; the rest are proxies, whose limits belong to whoever owns them.
+    """
+    with _gates_lock:
+        live = list(_gates.items())
+    shared = next((g for k, g in live if k == "shared"), None)
+    return {
+        "in_flight": shared.held if shared else 0,
+        "waiting": shared.waiting if shared else 0,
+        "max_concurrent": shared.limit if shared else shared_limit(),
+        "queues": len(live),
+        "in_flight_all": sum(g.held for _, g in live),
+    }
+
+
+def resize_shared(limit: int) -> int:
+    """Change what the shared address admits, now and for the next queue."""
+    with _gates_lock:
+        gate = _gates.get("shared")
+    applied = gate.resize(limit) if gate else max(1, min(int(limit), HARD_MAX))
+    # Persisted as well as applied: queues are made and dropped as work comes
+    # and goes, so a limit that lived only on the current object would be lost
+    # the moment the address went quiet.
+    config.save({"server_max_concurrent": applied})
+    return applied
+
+
+@contextmanager
+def queue_for(egress: str | None = None, limit: int | None = None,
+              wait: float = QUEUE_WAIT):
+    """Take a slot on this egress's queue, making the queue if there is none.
+
+    The claim is taken under the registry lock, before the gate is used and
+    before anyone else can drop it. That is the whole trick: a gate with users
+    cannot be removed, so a caller that has just looked one up can never find it
+    swept away and replaced by a second gate for the same address, which would
+    quietly double the limit it exists to enforce.
+
+    The last caller out removes it. A long-running process therefore holds one
+    entry per address currently working, not one per address ever seen.
+    """
     key = egress or "shared"
+    default = int(config.get("server_max_concurrent", 4))
     with _gates_lock:
         gate = _gates.get(key)
         if gate is None:
-            gate = _gates[key] = Gate(limit or int(config.get("server_max_concurrent", 4)))
+            gate = _gates[key] = Gate(limit or default)
         elif limit and limit != gate.limit:
             gate.resize(limit)             # its owner changed their setting
-        return gate
+        gate.users += 1
+    try:
+        with gate.slot(wait):
+            yield gate
+    finally:
+        with _gates_lock:
+            gate.users -= 1
+            # `is` rather than `in`: only drop the gate we actually claimed.
+            if gate.users == 0 and _gates.get(key) is gate:
+                del _gates[key]
 
 
-# The shared address, which is what everyone without a proxy of their own uses.
-_gate = gate_for()
+
 
 if not API_TOKEN:
     raise SystemExit(
@@ -178,8 +242,8 @@ def _egress(body):
     from . import egress as eg
 
     proxy = getattr(body, "proxy", None) or None
-    gate = gate_for(eg.key(proxy), getattr(body, "proxy_concurrency", None))
-    with gate.slot(), eg.through(proxy):
+    with queue_for(eg.key(proxy), getattr(body, "proxy_concurrency", None)), \
+            eg.through(proxy):
         yield
 
 
@@ -277,8 +341,8 @@ def _unhandled(_: Request, e: Exception):
 def health():
     return {"ok": True, "model": _state["model"],
             "uptime_seconds": round(time.time() - _state["started"], 1),
-            "requests": _state["requests"], "in_flight": _gate.held,
-            "max_concurrent": _gate.limit, "timeout_seconds": _limits["timeout"],
+            "requests": _state["requests"], **busy(),
+            "timeout_seconds": _limits["timeout"],
             "hard_max": HARD_MAX, "rejected_busy": _state["rejected"],
             "auth": bool(API_TOKEN),
             "warm_seconds": round(_state["warm_seconds"], 1)}
@@ -299,7 +363,7 @@ def status():
 @app.get("/config", dependencies=[Depends(auth)])
 def get_config():
     return {**config.load(reload=True),
-            "server_max_concurrent": _gate.limit,
+            "server_max_concurrent": busy()["max_concurrent"],
             "server_timeout": _limits["timeout"]}
 
 
@@ -307,7 +371,7 @@ def get_config():
 def set_config(body: Settings):
     changed, persist_now = {}, {}
     if body.server_max_concurrent is not None:
-        changed["server_max_concurrent"] = _gate.resize(body.server_max_concurrent)
+        changed["server_max_concurrent"] = resize_shared(body.server_max_concurrent)
     if body.server_timeout is not None:
         _limits["timeout"] = body.server_timeout
         changed["server_timeout"] = body.server_timeout
@@ -331,7 +395,7 @@ def set_config(body: Settings):
     if to_save:
         config.save(to_save)
     return {"applied": changed, "persisted": sorted(to_save),
-            "in_flight": _gate.held}
+            "in_flight": busy()["in_flight_all"]}
 
 
 @app.post("/analyze", dependencies=[Depends(auth)],
@@ -427,7 +491,7 @@ def analyze_stream(body: Analyze):
 def why(body: Why):
     from . import diagnose, scrape
     _state["requests"] += 1
-    with _gate.slot(), session() as con:
+    with queue_for(), session() as con:
         return diagnose.why(con, body.keyword, scrape.parse_package(body.pkg),
                             country=body.country or config.get("country", "us"))
 
@@ -578,7 +642,7 @@ def expand(body: Query):
     answers, which is slow the first time and cached afterwards."""
     from . import suggest as sugg_mod
     _state["requests"] += 1
-    with _gate.slot(), session() as con:
+    with queue_for(), session() as con:
         return sugg_mod.expand(con, body.keyword,
                                country=config.get("country", "us"),
                                ttl_hours=0 if body.no_cache else 24.0)
@@ -637,7 +701,7 @@ def refetch(body: Refetch):
         for kw in words:
             _refetch["keyword"] = kw
             try:
-                with _gate.slot(), session() as con:
+                with queue_for(), session() as con:
                     scrape.scrape_keyword(con, kw, verbose=False)
             except Exception as e:                       # noqa: BLE001
                 _refetch["failed"] += 1
@@ -659,7 +723,7 @@ def refetch(body: Refetch):
 @app.post("/search", dependencies=[Depends(auth)])
 def search(body: Query):
     from . import play
-    with _gate.slot():
+    with queue_for():
         out = play.search(body.keyword, with_details=body.details, limit=body.limit)
     return {"query": body.keyword, "results": out,
             "organic": sum(1 for r in out if r["position"])}
@@ -691,5 +755,5 @@ def _warm():
     _state["warm_seconds"] = time.time() - t0
     _state["started"] = time.time()
     print(f"  model {_state['model']} warm in {_state['warm_seconds']:.1f}s  "
-          f"| {_gate.limit} concurrent | auth "
+          f"| {shared_limit()} concurrent | auth "
           f"{'on' if API_TOKEN else 'off'}", flush=True)
