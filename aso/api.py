@@ -561,7 +561,7 @@ def _write_progress() -> None:
         pass                       # progress reporting must never fail a run
 
 
-def _run_training(epochs: int, warm_start: bool = False) -> None:
+def _run_training(epochs: int, warm_from: str | None = None) -> None:
     from . import train as tr
 
     def progress(phase, done, total, note):
@@ -576,7 +576,7 @@ def _run_training(epochs: int, warm_start: bool = False) -> None:
         with session() as con:
             version, meta, gated = tr.train(con, epochs=epochs, verbose=False,
                                             progress=progress,
-                                            warm_start=warm_start)
+                                            warm_from=warm_from)
             active = tr.load_active(con)[2]
         _job.update(state="done", finished=time.time(),
                     result={"version": version, "promoted": not gated,
@@ -612,7 +612,7 @@ def _run_training(epochs: int, warm_start: bool = False) -> None:
 
 @app.post("/train", dependencies=[Depends(auth)],
           summary="start a training run in the background")
-def train(epochs: int = 400, warm_start: bool = False):
+def train(epochs: int = 400, warm_from: str | None = None):
     with _job_lock:
         if _job["state"] == "running":
             raise HTTPException(409, {
@@ -621,12 +621,12 @@ def train(epochs: int = 400, warm_start: bool = False):
                 "started_seconds_ago": round(time.time() - (_job["started"] or 0), 1)})
         _job.update(state="running", started=time.time(), finished=None,
                     result=None, error=None, epochs=epochs, cancel=False,
-                    warm_start=warm_start,
+                    warm_from=warm_from,
                     phase="starting", step=0, steps=0, note="")
     _write_progress()
-    threading.Thread(target=_run_training, args=(epochs, warm_start), daemon=True,
+    threading.Thread(target=_run_training, args=(epochs, warm_from), daemon=True,
                      name="aso-train").start()
-    return {"state": "running", "epochs": epochs, "warm_start": warm_start,
+    return {"state": "running", "epochs": epochs, "warm_from": warm_from,
             "detail": "training started; analysis continues on the current model",
             "poll": "GET /train"}
 

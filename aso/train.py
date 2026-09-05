@@ -76,7 +76,7 @@ def _fit_member(model, xm, xf, y, v, w, xs=None, xb=None, mask=None, rank=None,
 
 
 def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
-          progress=None, warm_start=False):
+          progress=None, warm_from=None):
     """`progress(phase, done, total, note)` is called as the run advances.
 
     Training takes ~45 seconds and is started from a chat where "working on it"
@@ -106,11 +106,14 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
     # underneath them is the one change that makes the inherited weights mean
     # something else - the run would then spend its epochs recovering from the
     # shift rather than improving on the parent.
-    parent, parent_blob = None, None
-    if warm_start:
-        got = load_active(con, create=False)     # never bootstraps: read only
-        if got[0] is not None:
-            parent, parent_blob = got[2], got[1]
+    parent, parent_blob, parent_model = None, None, None
+    if warm_from:
+        row = con.execute("SELECT version, path FROM registry WHERE version=%s",
+                          (warm_from,)).fetchone()
+        got = _usable(row["path"]) if row else None
+        if got:
+            parent_model, parent_blob = got
+            parent = row["version"]
 
     if parent_blob is not None:
         sm = features.Scaler.load(parent_blob["scaler_mono"])
@@ -179,9 +182,8 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
     # across that quietly would be worse than starting over.
     lr = 0.05
     if parent is not None:
-        got = load_active(con, create=False)
-        if got[0] is not None and got[0].cfg == model.cfg:
-            model.load_state_dict(got[0].state_dict())
+        if parent_model.cfg == model.cfg:
+            model.load_state_dict(parent_model.state_dict())
             # A fifth of the usual step. At the full rate a fresh optimiser
             # walks the inherited weights far enough in the first few epochs
             # that continuing and starting over converge to the same place, and
