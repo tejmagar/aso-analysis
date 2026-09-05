@@ -200,11 +200,16 @@ class Ensemble(nn.Module):
 
     # ---- persistence -----------------------------------------------------
     def save(self, path: Path, scaler_mono, scaler_free, meta: dict,
-             scaler_set=None) -> None:
+             scaler_set=None, downloads=None) -> None:
+        # `downloads` is the separate page-reading downloads ensemble. It shares
+        # nothing with this model but the checkpoint file, so that one version
+        # number covers both and neither can be served against a mismatched
+        # partner. A checkpoint predating it simply has None here.
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         torch.save({"cfg": self.cfg, "state": self.state_dict(),
                     "scaler_mono": scaler_mono, "scaler_free": scaler_free,
-                    "scaler_set": scaler_set, "meta": meta}, path)
+                    "scaler_set": scaler_set, "downloads": downloads,
+                    "meta": meta}, path)
 
     @staticmethod
     def load(path: Path):

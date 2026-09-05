@@ -21,7 +21,8 @@ os.environ["ASO_DB"] = str(_TMP)
 import numpy as np                                              # noqa: E402
 import torch                                                    # noqa: E402
 
-from aso import correct, dataset, db, features, memory, predict, train  # noqa: E402
+from aso import (correct, dataset, db, downloads, features, memory,  # noqa: E402
+                 predict, train)
 from aso.model import Ensemble                                  # noqa: E402
 from aso.scrape import organic_positions, parse_date, parse_int  # noqa: E402
 
@@ -643,6 +644,104 @@ def _empty_the_test_db() -> None:
     con.close()
 
 
+def test_downloads_reads_the_page_not_the_world():
+    """The downloads model must answer from the page it is shown.
+
+    Its whole reason for existing is that it never learns a global level, so
+    the test that matters is not accuracy but INVARIANCE: multiply every rate
+    on a page by a thousand and the answer must move by the same factor. A
+    model that had memorised what apps earn would barely budge.
+    """
+    obs = downloads.stamp("2026-09-05")
+    def page(scale):
+        return [(obs - 2400, 1, 8_000_000.0 * scale), (obs - 80, 3, 1_000.0 * scale),
+                (obs - 220, 4, 500.0 * scale), (obs - 1400, 5, 1_100.0 * scale),
+                (obs - 60, 7, 1_400.0 * scale), (obs - 30, 12, 200.0 * scale)]
+
+    # Trained on one page at one level, then shown the same page a thousand
+    # times louder. Nothing about the shape changed, only the units.
+    X, M, Y = [], [], []
+    rng = np.random.default_rng(0)
+    for _ in range(200):
+        s = float(np.exp(rng.normal(0, 3)))          # levels spanning ~e^6
+        pts = page(s)
+        for held in range(len(pts)):
+            rest = [p for i, p in enumerate(pts) if i != held]
+            rel, rank, rate = pts[held]
+            x, m = downloads.describe(rest, rel, rank, obs)
+            X.append(x); M.append(m); Y.append(np.log1p(rate))
+    X = np.stack(X); M = np.stack(M); Y = np.array(Y, "float32")
+    net, curve = downloads.fit(X, M, Y, epochs=300, seed=0)
+    check("downloads model converges", curve[-1] < curve[0],
+          f"loss {curve[0]:.3f} -> {curve[-1]:.3f}")
+
+    def ask(scale):
+        x, m = downloads.describe(page(scale), obs, 9, obs)
+        return float(np.expm1(np.clip(downloads.predict(net, x[None], m[None])[0], 0, 30)))
+
+    # A tight band on purpose. The page's level is subtracted before the
+    # network sees anything and added back after, so this is a property of the
+    # architecture, not something the fit has to discover - a loose bound here
+    # would pass even if that centring were deleted. It is not exactly 1000x
+    # only because log1p is not log at the quiet end of the page.
+    quiet, loud = ask(1.0), ask(1000.0)
+    check("answer scales with the page", 800 < loud / max(quiet, 1e-9) < 1250,
+          f"{quiet:.1f} -> {loud:.1f} is {loud / max(quiet, 1e-9):.0f}x for a 1000x page")
+
+
+def test_release_date_beats_age_as_the_coordinate():
+    """A release in the FUTURE has to be representable.
+
+    Age bottoms out at zero, so "an app shipping next week" is not a number an
+    age-based model can be handed. Release dates are a line: next week is
+    simply further along it, and every app on the page reads as further behind.
+    """
+    obs = downloads.stamp("2026-09-05")
+    pts = [(obs - 400, 1, 5000.0), (obs - 40, 4, 90.0)]
+    now, _ = downloads.describe(pts, obs, 6, obs)
+    later, _ = downloads.describe(pts, obs + 7, 6, obs)
+    check("future release is a valid query",
+          bool((later[:2, 0] < now[:2, 0]).all()),
+          f"peers move {now[0, 0]:.3f} -> {later[0, 0]:.3f} when the query ships a week later")
+    check("peers of a brand-new app all read as older",
+          bool((now[:2, 0] < 0).all()), f"offsets {now[:2, 0].round(3)}")
+    check("an unparseable date is not the epoch", downloads.stamp("not a date") is None)
+
+
+def test_downloads_model_survives_the_checkpoint():
+    """The ensemble has to come back off disk bit-identical, and an OLD
+    checkpoint has to keep working.
+
+    Serving picks the downloads model out of the same file as the rank model,
+    so a broken round-trip would not fail loudly - it would quietly serve
+    different numbers than the run that was measured and promoted. And a
+    checkpoint written before this model existed must still load, or deploying
+    it would take down whatever is currently active.
+    """
+    import tempfile
+    obs = downloads.stamp("2026-09-05")
+    pts = [(obs - 2400, 1, 8e6), (obs - 80, 3, 1e3), (obs - 220, 4, 5e2)]
+    q = [(10, 5), (50, 8), (300, 2)]
+    X = np.stack([downloads.describe(pts, obs - d, r, obs)[0] for d, r in q])
+    M = np.stack([downloads.describe(pts, obs - d, r, obs)[1] for d, r in q])
+    ens, _ = downloads.fit_ensemble(X, M, np.array([3., 5., 9.], "float32"),
+                                    k=3, epochs=30, seed=0)
+    before, _ = ens(X, M)
+
+    m = Ensemble(4, 3, k=2, hidden=8, n_app=0)
+    path = Path(tempfile.mkdtemp()) / "t.pt"
+    ident = ({"mean": [0] * 4, "std": [1] * 4}, {"mean": [0] * 3, "std": [1] * 3})
+    m.save(path, *ident, {"features": []}, downloads=ens.state())
+    blob = torch.load(path, weights_only=False)
+    after, _ = downloads.Ensemble.load(blob["downloads"])(X, M)
+    check("downloads ensemble round-trips exactly", bool(np.allclose(before, after)),
+          f"{before.round(3)} vs {after.round(3)}")
+
+    m.save(path, *ident, {"features": []})
+    check("a checkpoint without one still loads",
+          torch.load(path, weights_only=False).get("downloads") is None)
+
+
 def main():
     print(f"\ntest db: {_TMP}\n")
     _refuse_production()
@@ -655,6 +754,9 @@ def main():
                test_model_is_monotone, test_free_features_are_unconstrained,
                test_residual_is_local_and_bounded, test_rank_target_is_exact,
                test_split_is_by_keyword,
+               test_downloads_reads_the_page_not_the_world,
+               test_release_date_beats_age_as_the_coordinate,
+               test_downloads_model_survives_the_checkpoint,
                test_end_to_end]:
         print(f"{fn.__name__}:")
         fn()

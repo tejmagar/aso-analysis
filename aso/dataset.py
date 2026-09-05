@@ -10,7 +10,7 @@ import math
 
 import numpy as np
 
-from . import db, embed, features, history, intent, suggest
+from . import db, downloads, embed, features, history, intent, suggest
 
 TOP_K = 10          # "ranks" means reaching the top 10
 NEW_APP_YEARS = 1.5  # only these carry a meaningful installs-per-year label
@@ -23,6 +23,7 @@ def build(con, country: str = "us", top_n: int = TOP_K):
 
     feats, labels, vel, groups, meta = [], [], [], [], []
     pages, blind, masks, ranks = [], [], [], []
+    dl_pts, dl_mask, dl_y = [], [], []
     for kw, rs in by_kw.items():
         kv = embed.keyword_vec(kw)
         feat_rows = db.featured_apps(con, kw, country)
@@ -88,6 +89,27 @@ def build(con, country: str = "us", top_n: int = TOP_K):
             # the range that matters most.
             vel.append(math.log1p(features._rate_of(r))
                        if 0 < age <= NEW_APP_YEARS else float("nan"))
+            # The same page again, for the downloads model, as bare
+            # (released, rank, rate) triples with this app removed. It reads
+            # the level off its neighbours rather than reconstructing it, so
+            # unlike the head above it can be asked about an app of ANY age -
+            # the query's release date is an input, and how much a rate owes to
+            # having been on sale for eight years is a relation to learn, not a
+            # confound to exclude. That takes it from 172 labelled rows to
+            # every app on every page that reports a release date.
+            q_rel = downloads.stamp(r.get("released_at"))
+            observed = downloads.stamp(r.get("observed_at"))
+            pts = downloads.page_points(rs, exclude_pkg=r["pkg"],
+                                        near_rank=r["position"])
+            if q_rel is not None and observed is not None and pts:
+                dx, dm = downloads.describe(pts, q_rel, r["position"], observed)
+                dl_y.append(math.log1p(features._rate_of(r)))
+            else:
+                dx = np.zeros((16, downloads.POINT_FEATS), "float32")
+                dm = np.zeros(16, "float32")
+                dl_y.append(float("nan"))
+            dl_pts.append(dx)
+            dl_mask.append(dm)
             groups.append(kw)
             meta.append({"pkg": r["pkg"], "keyword": kw, "position": r["position"],
                          "source": r["source"],
@@ -100,6 +122,8 @@ def build(con, country: str = "us", top_n: int = TOP_K):
             "v": np.array(vel, "float32"),
             "xs": np.stack(pages), "xs_blind": np.stack(blind),
             "mask": np.stack(masks), "rank": np.array(ranks, "float32"),
+            "dl_x": np.stack(dl_pts), "dl_mask": np.stack(dl_mask),
+            "dl_y": np.array(dl_y, "float32"),
             "groups": np.array(groups), "meta": meta, "feats": feats}
 
 

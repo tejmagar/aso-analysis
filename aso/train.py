@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from . import dataset, db, features, memory, metrics
+from . import dataset, db, downloads, features, memory, metrics
 from .model import Ensemble, n_params
 
 # Where trained checkpoints live. Overridable because in a container the repo
@@ -34,6 +34,52 @@ SHIPPED = Path(__file__).resolve().parent.parent / "models" / "latest.pt"
 # validate against, so the regression gate is not applied yet.
 MIN_KEYWORDS = 25
 MIN_AUC = 0.55        # only enforced once the split is measurable
+
+
+def _factor(pred, true):
+    """How many times out an answer is, never less than 1x.
+
+    Log-space error hides what matters here: 1.4 in log units is a four-fold
+    error on screen. The floor at one install a year keeps a prediction of two
+    against a truth of zero from reporting an infinite ratio.
+    """
+    p = np.maximum(np.expm1(np.clip(pred, 0, 30)), 1.0)
+    t = np.maximum(np.expm1(np.clip(true, 0, 30)), 1.0)
+    r = p / t
+    return np.maximum(r, 1.0 / r)
+
+
+def _feature_pull(model) -> dict:
+    """How hard each input actually pushes the rank logit, by name.
+
+    Not an explanation of any single answer - it is the model's standing
+    opinion about which inputs matter. Worth having because features have been
+    added here on argument, and argument is how a feature that carries nothing
+    survives: a column of zeros looks exactly like a column the model chose to
+    ignore, and neither shows up in a loss.
+
+    The path is short enough to read directly. A monotone input reaches the
+    hidden layer through softplus(wm) and the hidden layer reaches the logit
+    through softplus(w2), both positive, so their product is the pull. A free
+    input arrives through a signed linear layer, so its magnitude is taken.
+    Averaged over the members, then scaled to the largest, because the absolute
+    size means nothing and the ordering is the whole point.
+    """
+    from . import features as F_
+
+    mono = np.zeros(len(F_.MONO)); free = np.zeros(len(F_.FREE))
+    for m in model.members:
+        w2 = F.softplus(m.w2).detach().numpy()                    # hidden -> logit
+        wm = F.softplus(m.wm).detach().numpy()                    # mono -> hidden
+        mono += (wm * w2[None, :]).sum(1)
+        if m.free is not None:
+            fw = np.abs(m.free.weight.detach().numpy())           # hidden x free
+            free += (fw * w2[:, None]).sum(0)
+    pull = {f.name: float(v) for f, v in zip(F_.MONO, mono / len(model.members))}
+    pull.update({f.name: float(v) for f, v in zip(F_.FREE, free / len(model.members))})
+    top = max(pull.values()) or 1.0
+    return {k: round(v / top, 4) for k, v in
+            sorted(pull.items(), key=lambda kv: -kv[1])}
 
 
 def _pairs_within(groups, positions, rng, per_keyword=60):
@@ -329,8 +375,67 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
         vel = {"n": 0, "mae_log": None, "factor_p50": None,
                "factor_p90": None, "spread_log_p50": None}
 
+    # The separate downloads model, fitted on the same split.
+    #
+    # It shares no weights with the model above and does not see its features.
+    # It is given the page as bare (release date, rank, rate) points and asked
+    # what an app shipping now, at a given rank, would earn - so the page's
+    # LEVEL arrives with the data instead of being reconstructed from features,
+    # and the only thing left to learn is the part that carries across pages.
+    # That also frees it from the under-18-month restriction the head needs:
+    # the query's release date is an input here, so an eight-year-old app is a
+    # valid example of what eight years of ranking earns rather than a
+    # confound, which is why it trains on several thousand rows and not 172.
+    DX, DM, DY = data["dl_x"], data["dl_mask"], data["dl_y"]
+    dl_has = ~np.isnan(DY)
+    dl_tr, dl_ho = tr & dl_has, ho & dl_has
+    dl_state, dl = None, {"n": 0, "factor_p50": None, "factor_p90": None,
+                          "mae_log": None, "train_loss": None, "rows": 0}
+    if dl_tr.sum() >= 50:
+        say("downloads", 0, k, f"{int(dl_tr.sum())} rows with a rate")
+        dl_model, dl_curves = downloads.fit_ensemble(
+            DX[dl_tr], DM[dl_tr], DY[dl_tr], k=k, epochs=epochs, seed=seed,
+            on_member=lambda i, n, l: say("downloads", i, n, f"loss {l:.4f}"))
+        dl_state = dl_model.state()
+        dl = {"n": int(dl_ho.sum()), "rows": int(dl_tr.sum()),
+              "train_loss": float(np.mean([c[-1] for c in dl_curves]))}
+        if dl_ho.sum():
+            dm, dsp = dl_model(DX[dl_ho], DM[dl_ho])
+            dt = DY[dl_ho]
+            r = _factor(dm, dt)
+            dl.update(mae_log=float(np.abs(dm - dt).mean()),
+                      factor_p50=float(np.percentile(r, 50)),
+                      factor_p90=float(np.percentile(r, 90)),
+                      spread_log_p50=float(np.percentile(dsp, 50)))
+
+        # It only gets to answer if it beats the head it replaces, judged on the
+        # SAME apps. The two are otherwise scored on different populations - the
+        # head can only label apps under eighteen months, this one labels every
+        # age - so their headline numbers are not comparable and promoting on
+        # them would be a coin toss. Restricting to the head's own rows makes it
+        # one question: on the apps both can answer, which is closer?
+        #
+        # Without this, training would hand serving to the new model whatever it
+        # scored, since the promotion gate above only reads rank AUC.
+        both = ho & dl_has & ~np.isnan(data["v"])
+        if both.sum() >= 30:
+            mine, _ = dl_model(DX[both], DM[both])
+            theirs = v_ho.numpy()[both[ho]] if ho.sum() else None
+            truth = data["v"][both]
+            mine_p50 = float(np.percentile(_factor(mine, truth), 50))
+            head_p50 = (float(np.percentile(_factor(theirs, truth), 50))
+                        if theirs is not None else None)
+            dl.update(head_to_head_n=int(both.sum()), head_to_head=mine_p50,
+                      head_to_head_baseline=head_p50)
+            if head_p50 is not None and mine_p50 > head_p50:
+                dl["used"] = False
+                dl_state = None          # serving keeps the head
+            else:
+                dl["used"] = True
+
     meta = {
         "features": [f.name for f in features.REGISTRY],
+        "downloads_model": dl,
         "n_rows": int(len(y)), "n_keywords": int(len(np.unique(data["groups"]))),
         "golden_auc": g_auc, "golden_ece": g_ece,
         # The ceiling for the downloads head: the highest first-year rate the
@@ -353,6 +458,9 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
         # different when it inherited a fitted model than when it did not.
         "init": "finetuned" if parent else "scratch",
         "parent": parent, "lr": lr,
+        # What the run decided to lean on. Kept so a feature that carries
+        # nothing can be deleted on evidence rather than defended on argument.
+        "pull": _feature_pull(model),
     }
 
     # Two independent gates. The relative one stops a regression; the absolute
@@ -369,7 +477,8 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
     gated = regressed or no_signal
     version = f"v{db.scalar(con, 'SELECT COUNT(*) FROM registry') + 1}"
     path = MODELS / f"{version}.pt"
-    model.save(path, sm.state(), sf.state(), meta, scaler_set=ss.state())
+    model.save(path, sm.state(), sf.state(), meta, scaler_set=ss.state(),
+           downloads=dl_state)
 
     with con.transaction():
         con.execute("INSERT INTO registry (version, path, created_at, n_rows, "
@@ -378,10 +487,12 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
                     (version, str(path), db.now(), len(y), g_auc, g_ece,
                      _json.dumps({"train_loss": meta["train_loss"],
                                   "downloads": vel,
+                                  "downloads_model": dl,
                                   "labelled_rows": meta["labelled_rows"],
                                   "epochs": epochs, "seed": seed,
                                   "members": k,
-                                  "init": meta["init"], "parent": parent})))
+                                  "init": meta["init"], "parent": parent,
+                                  "pull": dict(list(meta["pull"].items())[:24])})))
         if not gated:
             con.execute("UPDATE registry SET active=0")
             con.execute("UPDATE registry SET active=1 WHERE version=%s", (version,))
@@ -405,6 +516,12 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
             print(f"  ! only {meta['n_keywords']} keywords: the golden split is a "
                   f"single keyword and its score is noise, not a measurement")
         print(f"  golden AUC {g_auc:.3f}  ECE {g_ece:.3f}")
+        lean = list(meta["pull"].items())[:6]
+        print("  leans on: " + ", ".join(f"{n} {v:.2f}" for n, v in lean))
+        dead = [n for n, v in meta["pull"].items() if v < 0.01]
+        if dead:
+            print(f"  carrying nothing ({len(dead)}): " + ", ".join(dead[:8])
+                  + (" ..." if len(dead) > 8 else ""))
         tl = meta["train_loss"]
         print(f"  train loss {tl['mean']:.4f} +/- {tl['spread']:.4f} across "
               f"{len(tl['per_member'])} members")
@@ -418,6 +535,15 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
         else:
             print("  downloads head: NOT MEASURED - no held-out row carries a "
                   "downloads label, so the number it produces is unvalidated")
+        if dl["factor_p50"] is not None:
+            print(f"  downloads model: typically {dl['factor_p50']:.1f}x out, "
+                  f"{dl['factor_p90']:.1f}x at the 90th percentile "
+                  f"({dl['n']} held out, fitted on {dl['rows']})")
+        elif dl_state is not None:
+            print("  downloads model: fitted but NOT MEASURED - no held-out row "
+                  "carries a rate")
+        else:
+            print("  downloads model: not fitted, too few rows with a rate")
         if not measurable:
             print(f"  promoted: {version} is now active "
                   f"({meta['n_keywords']}/{MIN_KEYWORDS} keywords, not yet validated)")

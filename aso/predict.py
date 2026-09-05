@@ -14,7 +14,8 @@ import uuid
 import numpy as np
 import torch
 
-from . import db, embed, features, history, intent, memory, suggest, train
+from . import (db, downloads, embed, features, history, intent, memory, suggest,
+               train)
 from .dataset import TOP_K
 
 
@@ -290,12 +291,33 @@ def score_entry(con, keyword: str, country="us"):
     per_year = undo(float(v_mean))
     lo = undo(float(v_mean) - spread)
     hi = undo(float(v_mean) + spread)
+
+    # If this checkpoint carries the page-reading downloads model, it answers
+    # instead. It is asked about an app shipping TODAY at the rank the model
+    # just predicted, against the page as it was scraped - the same shape it was
+    # trained on, with the release date as the coordinate rather than an age, so
+    # "today" is an ordinary point on the line and not the edge of one.
+    answered_by = "head"
+    dl_states = blob.get("downloads")
+    if dl_states:
+        today = downloads.stamp(db.date.today().isoformat())
+        pts = downloads.page_points(rows, near_rank=entry_rank)
+        if pts:
+            dx, dmask = downloads.describe(pts, today, entry_rank, today)
+            dmean, dspread = downloads.Ensemble.load(dl_states)(dx[None], dmask[None])
+            ds = min(float(dspread[0]), SPREAD_CAP)
+            per_year = undo(float(dmean[0]))
+            lo = undo(float(dmean[0]) - ds)
+            hi = undo(float(dmean[0]) + ds)
+            spread = ds
+            answered_by = "page"
     return {
         "entry_rank": entry_rank,
         "downloads": {
             "per_year": per_year, "per_month": per_year / 12.0,
             "per_day": per_year / 365.0,
             "low_per_year": lo, "high_per_year": hi,
+            "answered_by": answered_by,
         },
         "confidence": conf, "agreement": agree, "evidence": evidence,
         "field_size": len(ranked),
