@@ -495,7 +495,15 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
     regressed = measurable and prev is not None and g_auc < prev["golden_auc"] - 0.01
     no_signal = measurable and g_auc < MIN_AUC
     gated = regressed or no_signal
-    version = f"v{db.scalar(con, 'SELECT COUNT(*) FROM registry') + 1}"
+    # Named from the HIGHEST version so far, not from how many rows there are.
+    # Counting assumes nothing is ever deleted, and the panel has a delete
+    # button: with v1, v4, v5 and v6 on file the count is four, so the next run
+    # called itself v5, collided with the existing row, and died with a
+    # UniqueViolation after doing all the fitting. Every later run would have
+    # failed the same way until the count overtook the highest name.
+    highest = db.scalar(con, "SELECT COALESCE(MAX(SUBSTRING(version FROM 2)"
+                             "::int), 0) FROM registry WHERE version ~ '^v[0-9]+$'")
+    version = f"v{highest + 1}"
     path = MODELS / f"{version}.pt"
     model.save(path, sm.state(), sf.state(), meta, scaler_set=ss.state(),
            downloads=dl_state)
