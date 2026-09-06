@@ -447,10 +447,15 @@ def train(con, country="us", k=7, hidden=24, epochs=400, seed=0, verbose=True,
             dl.update(head_to_head_n=int(both.sum()), head_to_head=mine_p50,
                       head_to_head_baseline=head_p50)
             if head_p50 is not None and mine_p50 > head_p50:
-                dl["used"] = False
                 dl_state = None          # serving keeps the head
-            else:
-                dl["used"] = True
+
+        # Derived from the checkpoint, never set alongside it. Written in the
+        # branches above, it was simply absent whenever the comparison did not
+        # run - too few apps both models could label - and the panel read that
+        # absence as "the head answers" and reported the head's error for a run
+        # the page model was serving. One source: what is in the checkpoint is
+        # what answers.
+        dl["used"] = dl_state is not None
 
     meta = {
         "features": [f.name for f in features.REGISTRY],
