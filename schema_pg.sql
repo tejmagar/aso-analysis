@@ -236,3 +236,11 @@ CREATE TABLE IF NOT EXISTS app_snapshots (
     PRIMARY KEY (pkg, observed_at)
 );
 CREATE INDEX IF NOT EXISTS app_snapshots_pkg_idx ON app_snapshots (pkg, observed_at DESC);
+
+-- Everything one publisher has shipped, by name.
+--
+-- Play's SEARCH caps near 50 results however many a developer actually has, so
+-- "show me this publisher's apps" cannot be answered from the store alone. What
+-- we have already scraped fills the rest in, and that lookup is by developer
+-- name - which was a sequential scan until this index.
+CREATE INDEX IF NOT EXISTS apps_developer_idx ON apps (developer) WHERE developer <> '';
